@@ -1132,7 +1132,14 @@ def _compute_global_precompute(
 
     t_phase = time.time()
     with torch.no_grad():
-        hidden = base_model.embed_tokens(ids).to(dtype)
+        # === embed_tokens / embeddings dual lookup ===
+        # NemotronH (Mamba-2 hybrid) uses `embeddings` instead of `embed_tokens`.
+        _embed_mod = getattr(base_model, "embed_tokens", None) or getattr(base_model, "embeddings", None)
+        if _embed_mod is None:
+            raise AttributeError(
+                f"base_model {type(base_model).__name__} has no "
+                f"embed_tokens or embeddings attribute")
+        hidden = _embed_mod(ids).to(dtype)
     position_embeddings = _compute_position_embeddings(
         base_model, hidden, position_ids)
 
