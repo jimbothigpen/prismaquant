@@ -125,6 +125,14 @@ def stage_text_only(model_path: str) -> str:
     if "num_local_experts" in cfg and "num_experts" not in cfg:
         cfg["num_experts"] = cfg["num_local_experts"]
 
+    # === llm_config → text_config promotion (NemotronH Nano Omni etc.) ===
+    # InternVL/NemotronH-Nano-Omni V3 expose the inner LM config as
+    # `llm_config`, not `text_config`. Promote it so the existing
+    # text_config logic below picks it up. Mirrors the same rename
+    # in convert_hf_to_gguf.ModelBase.load_hparams.
+    if "llm_config" in cfg and "text_config" not in cfg:
+        cfg["text_config"] = cfg.pop("llm_config")
+
     if "text_config" in cfg:
         tc = cfg.pop("text_config")
         for k, v in tc.items():
