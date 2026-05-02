@@ -168,7 +168,41 @@ def _init_rotary_inplace(base_model: nn.Module, device: torch.device,
         return
 
     # Single-rope path (the common case for Qwen / MiniMax / DSv3).
-    inv_freq, attention_scaling = rope_init_fn(cfg, device)
+    try:
+        inv_freq, attention_scaling = rope_init_fn(cfg, device)
+    except (KeyError, TypeError):
+        # Multi-layer-type rope (e.g., Gemma-4 iSWA): cfg.rope_parameters is a
+        # dict-of-dicts keyed by layer_type. Register a per-type inv_freq buffer
+        # and fall back to the first layer type for the generic single-rope attrs.
+        rope_params = getattr(cfg, "rope_parameters", None)
+        if not (isinstance(rope_params, dict) and rope_params and
+                all(isinstance(v, dict) for v in rope_params.values())):
+            raise
+        inv_freq = attention_scaling = None
+        for lt in rope_params.keys():
+            try:
+                lt_inv, lt_scale = rope_init_fn(cfg, device, layer_type=lt)
+            except TypeError:
+                continue
+            rotary.register_buffer(
+                f"{lt}_inv_freq",
+                lt_inv.to(dtype=torch.float32, device=device),
+                persistent=False,
+            )
+            setattr(rotary, f"{lt}_attention_scaling", lt_scale)
+            if inv_freq is None:
+                inv_freq, attention_scaling = lt_inv, lt_scale
+        if inv_freq is None:
+            raise
+        # Fallback alias for callers that invoke rotary forward without
+        # propagating layer_type (e.g., probe paths that bypass the parent
+        # layer module). The first layer_type wins.
+        rotary.register_buffer(
+            "None_inv_freq",
+            inv_freq.to(dtype=torch.float32, device=device),
+            persistent=False,
+        )
+        setattr(rotary, "None_attention_scaling", attention_scaling)
     rotary.register_buffer("inv_freq", inv_freq.to(
         dtype=torch.float32, device=device), persistent=False)
     if hasattr(rotary, "original_inv_freq"):
