@@ -1085,6 +1085,43 @@ class GlobalPrecompute:
     # Reusable forward-state derivable from ids + model; recomputed on demand.
 
 
+# === multi-layer-type rope per-layer position_embeddings ===
+
+
+def _resolve_layer_types(base_model):
+    """Return a list of layer_type strings (one per decoder layer), or None.
+    Used by the multi-layer-type rope path (Gemma-4 iSWA, etc.)."""
+    cfg = getattr(base_model, "config", None)
+    if cfg is None:
+        return None
+    lt = getattr(cfg, "layer_types", None)
+    if lt:
+        return list(lt)
+    tc = getattr(cfg, "text_config", None)
+    if tc is not None:
+        lt = getattr(tc, "layer_types", None)
+        if lt:
+            return list(lt)
+    return None
+
+
+def _compute_position_embeddings_for_layer(base_model, hidden, position_ids,
+                                           layer_type, _rotary_cache=None):
+    """Per-layer position_embeddings for multi-layer-type rope. Falls back
+    to the layer-type-agnostic call if the rotary doesn't accept layer_type
+    or if the type isn't registered."""
+    from .layer_streaming import _get_rotary
+    rotary = _get_rotary(base_model)
+    if rotary is None:
+        return None
+    import torch as _torch
+    with _torch.no_grad():
+        try:
+            return rotary(hidden, position_ids, layer_type=layer_type)
+        except TypeError:
+            return rotary(hidden, position_ids)
+
+
 def _compute_global_precompute(
     ctx: StreamingContext,
     *,
@@ -1156,6 +1193,7 @@ def _compute_global_precompute(
     # call. The pickled precompute cache (and downstream phase-3) want
     # CPU tensors, which we produce after the loop.
     device_acts: list[torch.Tensor] = [hidden.detach()]
+    _layer_types_list = _resolve_layer_types(base_model)
     for L in range(num_layers):
         load_t0 = time.time()
         src = ctx.install(L)
@@ -1166,9 +1204,13 @@ def _compute_global_precompute(
                 layers[L], True, chunk_size=minimax_fast_moe_chunk_size)
         fwd_t0 = time.time()
         with torch.no_grad():
+            _layer_pe = position_embeddings
+            if _layer_types_list is not None and L < len(_layer_types_list):
+                _layer_pe = _compute_position_embeddings_for_layer(
+                    base_model, hidden, position_ids, _layer_types_list[L])
             out = _call_layer(
                 layers[L], hidden,
-                position_embeddings=position_embeddings,
+                position_embeddings=_layer_pe,
                 attention_mask=causal_mask,
                 position_ids=position_ids,
                 **_profile.extra_layer_kwargs(input_ids=ids),
@@ -2168,9 +2210,14 @@ def _run_body_streaming_shard(
             # Forward + backward for this layer with the full batch.
             x_in = activations_cpu[L].to(device).to(dtype).detach().requires_grad_(True)
             bwd_t0 = time.time()
+            _shard_layer_types = _resolve_layer_types(base_model)
+            _layer_pe = position_embeddings
+            if _shard_layer_types is not None and L < len(_shard_layer_types):
+                _layer_pe = _compute_position_embeddings_for_layer(
+                    base_model, x_in, position_ids, _shard_layer_types[L])
             out = _call_layer(
                 layers[L], x_in,
-                position_embeddings=position_embeddings,
+                position_embeddings=_layer_pe,
                 attention_mask=causal_mask,
                 position_ids=position_ids,
                 **_shard_profile.extra_layer_kwargs(
