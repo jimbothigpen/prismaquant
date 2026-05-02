@@ -28,9 +28,9 @@ mathematical foundations and vLLM-targeted use cases — read that first.
 
 ## What this fork adds
 
-A series of focused patches on the `prismaquant-llama-compat` branch
-that enable `incremental_probe` to work on architectures we ran into
-while building [`prismaquant-llama`](https://github.com/jimbothigpen/prismaquant-llama).
+A series of focused patches on `main` that enable `incremental_probe`
+to work on architectures we ran into while building
+[`prismaquant-llama`](https://github.com/jimbothigpen/prismaquant-llama).
 Two clusters of patches:
 
 ### Generic / defensive (apply to any model with these patterns)
@@ -62,24 +62,25 @@ patches and tradeoffs.
 
 ## Branch policy
 
-- **`main`**: tracks `RobTand/prismaquant` upstream main, no
-  modifications.
-- **`prismaquant-llama-compat`**: our patch series. **Use this branch
-  for prismaquant-llama installs.** Periodically rebased on upstream
-  main so the fork stays current; PRs upstream will shrink this
-  branch over time.
+`main` IS the patch series — this fork's reason to exist is to carry
+the patches, so there's no point in keeping a "clean upstream mirror"
+branch. We periodically `git fetch upstream && git rebase upstream/main`
+to stay current with `RobTand/prismaquant`. PRs upstream will shrink
+the fork's footprint over time.
+
+If you need the unpatched upstream, use the `upstream` remote
+(`https://github.com/RobTand/prismaquant`) directly.
 
 ## Install for prismaquant-llama users
 
 ```bash
-pip install git+https://github.com/jimbothigpen/prismaquant.git@prismaquant-llama-compat
+pip install git+https://github.com/jimbothigpen/prismaquant.git
 ```
 
 Or for development:
 
 ```bash
-git clone --branch prismaquant-llama-compat \
-    https://github.com/jimbothigpen/prismaquant.git
+git clone https://github.com/jimbothigpen/prismaquant.git
 cd prismaquant
 pip install -e .
 ```
