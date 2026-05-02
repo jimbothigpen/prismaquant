@@ -827,9 +827,9 @@ def _build_streaming_context(model_path: str, *,
           f"dynamic_reserve={resolved_headroom_gb:.1f} GB, {src})",
           flush=True)
     if autoscale_diag is not None:
-        print(f"{log_prefix}   autoscale: shard_working={autoscale_diag['shard_working_gb']:.1f} GB "
-              f"+ safety={autoscale_diag['safety_gb']:.1f} GB "
-              f"(lps={autoscale_diag['layers_per_shard']})", flush=True)
+        print(f"{log_prefix}   autoscale: shard_working={autoscale_diag.get('shard_working_gb', 0):.1f} GB "
+              f"+ safety={autoscale_diag.get('safety_gb', 0):.1f} GB "
+              f"(lps={autoscale_diag.get('layers_per_shard', 0)})", flush=True)
 
     estimated_layer_bytes, layer_bytes = _estimate_layer_cache_bytes(
         weight_shard=weight_shard,
