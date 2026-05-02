@@ -951,6 +951,16 @@ def _get_layer_list(model: nn.Module):
         inner = getattr(lm, "model", lm)
         if hasattr(inner, "layers"):
             return inner, inner.layers
+    # === backbone.layers (NemotronH) fallback ===
+    # NemotronHForCausalLM exposes its decoder body at
+    # `model.backbone.layers` (Mamba-2 + attention hybrid).
+    backbone = getattr(model, "backbone", None)
+    if backbone is not None and hasattr(backbone, "layers"):
+        return backbone, backbone.layers
+    if cand is not None:
+        backbone = getattr(cand, "backbone", None)
+        if backbone is not None and hasattr(backbone, "layers"):
+            return backbone, backbone.layers
     raise RuntimeError("could not locate model.layers in model tree")
 
 
@@ -1031,9 +1041,14 @@ def _head_prefixes(root: nn.Module, base_prefix: str) -> list[str]:
     (DSv4 adds `model.hc_head.` for the multi-stream→single-stream
     collapse module)."""
     p = f"{base_prefix}." if base_prefix else ""
+    # === embeddings. prefix (NemotronH) ===
+    # NemotronH uses `embeddings` instead of `embed_tokens`; include both.
+    # Also includes `norm_f` (NemotronH's final norm name) alongside `norm`.
     prefixes = [
         f"{p}embed_tokens.",
+        f"{p}embeddings.",
         f"{p}norm.",
+        f"{p}norm_f.",
         "lm_head.",
         f"{p}rotary_emb.",
     ]
