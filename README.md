@@ -1,3 +1,28 @@
+# prismaquant — `jimbothigpen` fork
+
+> **This is a downstream fork of [`RobTand/prismaquant`](https://github.com/RobTand/prismaquant)
+> with patches needed to support
+> [`prismaquant-llama`](https://github.com/jimbothigpen/prismaquant-llama),
+> a llama.cpp/GGUF-targeting adapter for the prismaquant allocator.**
+> See [`FORK-NOTES.md`](FORK-NOTES.md) for the patch series, validated
+> architectures, and branch policy. Everything below this banner is
+> the upstream README, unchanged.
+
+> **Disclosure — this is vibe-coded.** I'm an enthusiast, not a
+> programmer. Every line of code, doc, and commit message in this
+> fork's patch series was written with
+> [Claude Code](https://claude.com/claude-code) doing the actual
+> implementation; I drive the design decisions, review changes, and
+> decide what ships. Assume AI-assisted unless explicitly stated
+> otherwise. Issues and PRs are welcome; just calibrate expectations
+> accordingly. The mathematical core of prismaquant (the closed-form
+> Δloss surrogate, the streaming-probe architecture, the allocator)
+> is [RobTand](https://github.com/RobTand/prismaquant)'s work, not
+> mine — this fork is just the compatibility patches needed to run
+> that work on a couple more architectures.
+
+---
+
 # PrismaQuant
 
 **Mixed-precision quantization for large language models, selected on real, end-to-end KL.**
