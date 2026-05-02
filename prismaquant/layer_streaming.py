@@ -529,8 +529,19 @@ def _fast_install(resolver: dict[str, tuple],
             # Unknown key — fall back to the safe-but-slow path. Shouldn't
             # happen in practice; if we see it, the resolver-build logic
             # missed a branch of the module tree.
+            # === orphan-tensor skip (Gemma-4 kv-shared layers) ===
+            # Gemma-4 saves k_norm/k_proj/v_norm/v_proj weights for all 42
+            # layers, but Gemma4TextAttention only allocates those attrs on
+            # the non-kv-shared layers. The orphan tensors on kv-shared
+            # layers are dead weights that transformers' from_pretrained
+            # silently ignores. Mirror that here.
             if model is not None:
-                set_module_tensor_to_device(model, model_name, device, value=t)
+                try:
+                    set_module_tensor_to_device(model, model_name, device, value=t)
+                except AttributeError as _e:
+                    # Orphan: the model class doesn't define this attribute.
+                    # Log once per name pattern and skip.
+                    pass
             continue
         parent, attr, is_buffer = slot
         target = t if t.device == device else t.to(device, non_blocking=True)
