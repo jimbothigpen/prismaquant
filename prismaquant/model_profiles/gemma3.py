@@ -72,10 +72,57 @@ class Gemma3Profile(ModelProfile):
     def live_to_recipe_name(self, live_qname: str) -> str:
         """Multimodal load wraps body Linears under
         `model.language_model.layers.X.*`; the text-only probe sees flat
-        `model.layers.X.*`. Strip the language_model. wrapper to align."""
+        `model.layers.X.*`. Strip the language_model. wrapper to align.
+        Also handles the unsloth repackage's reversed `language_model.model.X.`
+        layout."""
         if live_qname.startswith("model.language_model."):
             live_qname = "model." + live_qname[len("model.language_model."):]
+        elif live_qname.startswith("language_model.model."):
+            live_qname = "model." + live_qname[len("language_model.model."):]
         return live_qname
+
+    def checkpoint_to_live_name(self, ckpt_key: str, *,
+                                multimodal: bool = False) -> str | None:
+        """Override base to handle unsloth's reversed prefix convention.
+
+        Official HF gemma-3 multimodal checkpoints store body weights
+        under `model.language_model.layers.X.*`; the unsloth repackage
+        uses `language_model.model.layers.X.*` (vision_tower at top
+        level, language_model wrapping the inner Gemma3TextModel).
+        Both must collapse to flat `model.X.*` for the text-only probe
+        whose staged Gemma3ForCausalLM skeleton expects that layout.
+        """
+        if ckpt_key.endswith(".weight_scale_inv"):
+            return None
+        # Drop visual/audio/multimodal-projector keys when running text-only.
+        # Cover both the official `model.<vision_tower|visual>.X` location
+        # AND the unsloth top-level `vision_tower.X` / `multi_modal_projector.X`.
+        visual_drop_prefixes = (
+            "model.visual.",
+            "model.vision_tower.",
+            "model.audio_tower.",
+            "model.embed_vision.",
+            "model.embed_audio.",
+            "model.multi_modal_projector.",
+            "vision_tower.",
+            "audio_tower.",
+            "multi_modal_projector.",
+            "mtp.",
+        )
+        if any(ckpt_key.startswith(p) for p in visual_drop_prefixes):
+            if multimodal and not ckpt_key.startswith("mtp."):
+                return ckpt_key  # multimodal load keeps these
+            return None
+        if not multimodal:
+            if ckpt_key.startswith("model.language_model."):
+                return "model." + ckpt_key[len("model.language_model."):]
+            if ckpt_key.startswith("language_model.model."):
+                return "model." + ckpt_key[len("language_model.model."):]
+            if ckpt_key.startswith("language_model."):
+                # Strip just the wrapper. Inner top-level pieces (lm_head)
+                # remain at top level rather than nesting under "model.".
+                return ckpt_key[len("language_model."):]
+        return ckpt_key
 
     def stage_text_only_promote_inner_model_type(self) -> bool:
         # `Gemma3ForCausalLM.config: Gemma3TextConfig`. We need
