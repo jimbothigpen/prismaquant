@@ -16,6 +16,7 @@ MiniMaxM2Profile was archived 2026-04-24; see archive/minimax_m2p7/README.md.
 from .base import ModelProfile
 from .default import DefaultProfile
 from .deepseek_v4 import DeepseekV4Profile
+from .gemma3 import Gemma3Profile
 from .gemma4 import Gemma4Profile
 from .qwen3 import Qwen3Profile
 from .qwen3_5 import Qwen3_5Profile
@@ -44,6 +45,7 @@ __all__ = [
     "Qwen3MoeProfile",
     "Qwen3_5Profile",
     "Qwen3_5DenseProfile",
+    "Gemma3Profile",
     "Gemma4Profile",
     "detect_profile",
     "profile_from_config",

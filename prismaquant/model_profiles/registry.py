@@ -26,6 +26,7 @@ from pathlib import Path
 
 from .base import ModelProfile
 from .default import DefaultProfile
+from .gemma3 import Gemma3Profile
 from .gemma4 import Gemma4Profile
 from .qwen3 import Qwen3Profile
 from .qwen3_5 import Qwen3_5Profile
@@ -45,6 +46,7 @@ _REGISTERED: list[type[ModelProfile]] = [
     Qwen3_5Profile,
     Qwen3MoeProfile,  # must precede Qwen3Profile (MoE model_type includes qwen3)
     Qwen3Profile,  # original Qwen3 (dense, no MoE, no MTP) — after the 3.5 siblings
+    Gemma3Profile,  # text + SigLIP vision; multi-layer-type rope
     Gemma4Profile,
     MiniMaxM2Profile,
     DeepseekV4Profile,
