@@ -774,11 +774,24 @@ class ModelProfile(ABC):
         Default: passthrough."""
         return hidden
 
-    def extra_layer_kwargs(self, *, input_ids=None) -> dict:
+    def extra_layer_kwargs(self, *, input_ids=None, base_model=None,
+                           layer_idx=None) -> dict:
         """Extra kwargs to pass to `layer(...)` during phase-1/3.
         DSv4 hash-routed layers consume `input_ids` for the `tid2eid`
-        lookup; other architectures ignore it. Default: empty dict
-        (which the layer's `**kwargs` absorbs)."""
+        lookup; Gemma 4 uses `base_model` + `layer_idx` to compute the
+        proper per_layer_input slice (when the per-layer modules are
+        head-resident). Other architectures ignore both. Default:
+        empty dict (which the layer's `**kwargs` absorbs).
+
+        `base_model`: the LM body module (e.g. `Gemma4TextModel`),
+            available so profiles can reach into it for module-level
+            computations (e.g. Gemma 4's `get_per_layer_inputs` +
+            `project_per_layer_inputs`). Pass `None` to opt out and
+            let profiles fall back to their synthetic defaults.
+        `layer_idx`: the index of the decoder layer about to run. Used
+            by Gemma 4 to slice `per_layer_inputs[:, :, layer_idx, :]`.
+            `None` = unknown / first call; profiles either fall back or
+            return a layer-agnostic kwargs set."""
         return {}
 
     def should_probe_linear(self, name: str, mod) -> bool:

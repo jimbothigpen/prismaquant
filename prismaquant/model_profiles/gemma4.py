@@ -72,6 +72,41 @@ class Gemma4Profile(ModelProfile):
 
     # === streaming-probe hooks (Gemma-4 multi-layer-type rope + per_layer_input) ===
 
+    def head_resident_extra_prefixes(self, root) -> list[str]:
+        """Three modules drive the proper per_layer_input computation in
+        `extra_layer_kwargs`:
+          - `embed_tokens_per_layer` — token-identity component (large;
+             vocab_size_per_layer_input * num_layers * h_per_layer; e.g.
+             ~4.7 GB at BF16 on gemma-4-E2B-it, vocab 256K, 35 layers,
+             h_per=256).
+          - `per_layer_model_projection` — context-aware Linear (small).
+          - `per_layer_projection_norm` — RMSNorm (tiny).
+        Without these resident, `extra_layer_kwargs` falls back to an
+        all-ones synthetic per_layer_input, which biases Hessians for
+        `per_layer_input_gate` / `per_layer_projection` toward
+        over-allocation.
+
+        Memory note: the embed_tokens_per_layer cost is significant on
+        small-VRAM systems. ai00-class machines (MI300X 192 GB, etc.)
+        absorb it trivially; for tighter VRAM budgets a future
+        optimization could materialize → precompute → free instead of
+        keeping the full table resident. The current head-resident
+        approach is the simplest correct path."""
+        inner = getattr(root, "model", None)
+        if inner is not None and hasattr(inner, "embed_tokens_per_layer"):
+            return [
+                "model.embed_tokens_per_layer.",
+                "model.per_layer_model_projection.",
+                "model.per_layer_projection_norm.",
+            ]
+        if hasattr(root, "embed_tokens_per_layer"):
+            return [
+                "embed_tokens_per_layer.",
+                "per_layer_model_projection.",
+                "per_layer_projection_norm.",
+            ]
+        return []
+
     def init_rotaries(self, rotary, cfg, device, dtype) -> bool:
         """Gemma-4 has multi-layer-type rope: cfg.rope_parameters is a
         dict-of-dicts keyed by layer_type (e.g. full_attention,
@@ -141,21 +176,98 @@ class Gemma4Profile(ModelProfile):
         Gemma4Profile._num_global_kv_heads = int(global_kv) if global_kv else Gemma4Profile._num_kv_heads
         Gemma4Profile._attn_k_eq_v = bool(getattr(text_cfg, "attention_k_eq_v", False))
         Gemma4Profile._layer_types = list(getattr(text_cfg, "layer_types", []) or [])
+        # Clear the per-layer-inputs cache: it's per-probe-pass and stale
+        # state across init_rotaries calls would silently misroute slices.
+        Gemma4Profile._per_layer_inputs_cache = None
+        Gemma4Profile._per_layer_inputs_cache_key = None
 
         return True
 
-    def extra_layer_kwargs(self, *, input_ids=None) -> dict:
+    @staticmethod
+    def _maybe_compute_per_layer_input(base_model, input_ids, layer_idx):
+        """Compute the proper Gemma-4 per_layer_input slice for `layer_idx`
+        using `base_model.get_per_layer_inputs` + `project_per_layer_inputs`
+        (mirrors `modeling_gemma4.py:Gemma4TextModel.forward` lines
+        ~1632-1635).
+
+        Caches the full `[B, T, num_layers, hidden_per_layer]` tensor on
+        the class so we only run the (potentially large) embed_tokens_per_layer
+        lookup once per probe pass. Cache key: id(input_ids) + shape, which
+        invalidates correctly because the probe loop reuses one input_ids
+        tensor across every layer.
+
+        Returns the slice tensor on success; `None` if any of:
+          - env `PRISMAQUANT_GEMMA4_DISABLE_PROPER_PLI=1` (manual opt-out)
+          - base_model lacks the per-layer modules (not Gemma 4)
+          - per_layer modules are still meta-device (head-resident not
+            applied yet, or extra prefixes unset)
+          - any unexpected error raised during the computation
+        Caller falls back to the synthetic all-ones tensor.
+
+        Manual opt-out: set `PRISMAQUANT_GEMMA4_DISABLE_PROPER_PLI=1` in
+        the environment to force the synthetic-ones fallback. Useful when
+        the ~4.7 GB embed_tokens_per_layer head-resident cost is
+        prohibitive (small-VRAM systems) and the over-allocation bias
+        on per_layer_input_gate / per_layer_projection is acceptable."""
+        import os as _os
+        if _os.environ.get("PRISMAQUANT_GEMMA4_DISABLE_PROPER_PLI") == "1":
+            return None
+        import torch as _torch
+        cache_key = (
+            id(input_ids), tuple(input_ids.shape),
+            input_ids.device, input_ids.dtype,
+        )
+        cached = getattr(Gemma4Profile, "_per_layer_inputs_cache", None)
+        cached_key = getattr(Gemma4Profile, "_per_layer_inputs_cache_key", None)
+        if cached is None or cached_key != cache_key:
+            if not (hasattr(base_model, "embed_tokens_per_layer")
+                    and hasattr(base_model, "per_layer_model_projection")
+                    and hasattr(base_model, "per_layer_projection_norm")
+                    and hasattr(base_model, "get_per_layer_inputs")
+                    and hasattr(base_model, "project_per_layer_inputs")
+                    and hasattr(base_model, "embed_tokens")):
+                return None
+            try:
+                # Refuse if any of the modules' weights are still meta —
+                # head-resident materialization hasn't covered them.
+                etp_w = base_model.embed_tokens_per_layer.weight
+                if etp_w.device.type == "meta":
+                    return None
+                with _torch.no_grad():
+                    inputs_embeds = base_model.embed_tokens(input_ids)
+                    pli_token = base_model.get_per_layer_inputs(
+                        input_ids, inputs_embeds)
+                    pli = base_model.project_per_layer_inputs(
+                        inputs_embeds, pli_token)
+                Gemma4Profile._per_layer_inputs_cache = pli
+                Gemma4Profile._per_layer_inputs_cache_key = cache_key
+                cached = pli
+            except Exception:
+                return None
+        if cached is None or layer_idx is None:
+            return None
+        if layer_idx < 0 or layer_idx >= cached.size(2):
+            return None
+        return cached[:, :, layer_idx, :].contiguous()
+
+    def extra_layer_kwargs(self, *, input_ids=None, base_model=None,
+                           layer_idx=None) -> dict:
         """Gemma-4 decoder layers consume a per-layer additive embedding
         ("per_layer_input", shape [B, T, hidden_size_per_layer_input]).
-        The probe runs each layer in isolation; rather than precomputing
-        and slicing the model-level per_layer_inputs (which would require
-        keeping the per-layer embedding modules resident + threading layer_idx
-        through the call sites), we pass an all-ones tensor. This makes the
-        per_layer_input multiplication a no-op and slightly biases Hessians
-        for per_layer_input_gate / per_layer_projection toward over-allocation
-        — a conservative trade-off that yields valid probe data for everything
-        else (attn, main MLP, MoE experts). For full fidelity, replace this
-        with the proper sliced computation — see modeling_gemma4.py:1632."""
+
+        Preferred path: when `base_model` and `layer_idx` are provided
+        AND the per-layer modules are head-resident (see
+        `head_resident_extra_prefixes`), compute the proper slice via
+        `_maybe_compute_per_layer_input`. This makes the Hessians for
+        `per_layer_input_gate` / `per_layer_projection` reflect what
+        these Linears actually see at inference time.
+
+        Fallback (back-compat): pass an all-ones tensor. This makes the
+        per_layer_input multiplication a no-op and biases Hessians for
+        the two per-layer Linears toward over-allocation. Used when the
+        caller doesn't pass base_model/layer_idx, or when the per-layer
+        modules aren't resident (e.g., custom probe configurations that
+        don't honor head_resident_extra_prefixes)."""
         if input_ids is None:
             return {}
         # Use class-level state because profile_from_model returns fresh instances.
@@ -164,11 +276,16 @@ class Gemma4Profile(ModelProfile):
             return {}
         import torch as _torch
         B, T = input_ids.shape
-        per_layer_input = _torch.ones(
-            (B, T, H_per),
-            dtype=_torch.bfloat16,
-            device=input_ids.device,
-        )
+        per_layer_input = None
+        if base_model is not None and layer_idx is not None:
+            per_layer_input = Gemma4Profile._maybe_compute_per_layer_input(
+                base_model, input_ids, layer_idx)
+        if per_layer_input is None:
+            per_layer_input = _torch.ones(
+                (B, T, H_per),
+                dtype=_torch.bfloat16,
+                device=input_ids.device,
+            )
         kw = {"per_layer_input": per_layer_input}
         # Synthesize zero K/V tuples per layer so kv-shared layers
         # (which read shared_kv_states[kv_shared_layer_index] and unpack)

@@ -1213,7 +1213,8 @@ def _compute_global_precompute(
                 position_embeddings=_layer_pe,
                 attention_mask=causal_mask,
                 position_ids=position_ids,
-                **_profile.extra_layer_kwargs(input_ids=ids),
+                **_profile.extra_layer_kwargs(
+                    input_ids=ids, base_model=base_model, layer_idx=L),
             )
         fwd_s = time.time() - fwd_t0
         hidden = out
@@ -2221,7 +2222,8 @@ def _run_body_streaming_shard(
                 attention_mask=causal_mask,
                 position_ids=position_ids,
                 **_shard_profile.extra_layer_kwargs(
-                    input_ids=calib.to(device) if calib is not None else None),
+                    input_ids=calib.to(device) if calib is not None else None,
+                    base_model=base_model, layer_idx=L),
             )
             out.backward(grad_out.to(device))
             bwd_s = time.time() - bwd_t0

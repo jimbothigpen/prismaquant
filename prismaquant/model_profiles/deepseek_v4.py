@@ -292,10 +292,12 @@ class DeepseekV4Profile(ModelProfile):
             return base_model.hc_head(hidden)
         return hidden
 
-    def extra_layer_kwargs(self, *, input_ids=None) -> dict:
+    def extra_layer_kwargs(self, *, input_ids=None, base_model=None,
+                           layer_idx=None) -> dict:
         """DSv4 hash-routed layers (first `num_hash_layers`) consume
         `input_ids` for the `tid2eid` lookup. Other layers ignore the
-        kwarg via **kwargs absorption."""
+        kwarg via **kwargs absorption. `base_model` and `layer_idx` are
+        ignored — DSv4 doesn't need per-layer module-level state."""
         return {"input_ids": input_ids} if input_ids is not None else {}
 
     def register_vendored_modeling(self) -> None:
