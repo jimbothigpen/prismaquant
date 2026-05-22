@@ -60,6 +60,21 @@ tensors for kv-shared layers. See
 in the prismaquant-llama repo for the detailed breakdown of all seven
 patches and tradeoffs.
 
+### Architecture-specific (Gemma 3 profile)
+
+Gemma 3 has no `Gemma3Profile` in upstream — `DefaultProfile` was used,
+which fails in two ways: (1) `stage_text_only` leaves `model_type=gemma3`
+(the multimodal outer type), so `AutoConfig` resolves to a 26-layer default
+config instead of the 34-layer text config; (2) `Gemma3RotaryEmbedding`
+expects per-layer-type buffers (`<layer_type>_inv_freq`) registered by an
+`init_rotaries` hook — without it the skeleton's rotary stays on `meta`
+and the first decoder forward crashes in `apply_rotary_pos_emb`.
+
+| Patch | File | Why |
+|---|---|---|
+| Gemma 3 streaming-probe profile | `model_profiles/gemma3.py` | New `Gemma3Profile`: promotes inner `model_type` to `gemma3_text` so `AutoConfig` picks `Gemma3TextConfig` (builds `layer_types` from `sliding_window_pattern`); implements `init_rotaries` to register per-layer-type `inv_freq` / `attention_scaling` from `cfg.rope_parameters` (sliding vs full attention types) |
+| unsloth `language_model` wrapper unwrap | `model_profiles/gemma3.py` | Unsloth gemma-3 uses inverted nesting (`language_model.model.X`) vs HF official (`model.language_model.X`); `checkpoint_to_live_name` override rewrites and drops vision tower / projector keys so head tensors materialize correctly |
+
 ## Branch policy
 
 `main` IS the patch series — this fork's reason to exist is to carry
@@ -87,6 +102,7 @@ pip install -e .
 
 ## Validated arches via `prismaquant-llama`
 
+- `unsloth/gemma-3-4b-it` (multi-layer-type rope, sliding-window attention, partial rotary factor) — `Gemma3Profile`; unsloth checkpoint wrapping handled by `checkpoint_to_live_name` override
 - `google/gemma-4-E4B-it` (iSWA hybrid, partial rotary, kv-sharing) — required all 8 generic + 4 gemma-specific patches
 - `nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16` (Mamba-2 + MoE hybrid) — generic patches sufficient through Stage C config + layer-list resolution; deeper Mamba-2-specific blockers tracked separately
 - `unsloth/gpt-oss-20b-BF16` (MoE) — `DefaultProfile` path; no patches needed beyond the generic NemotronH support already merged
