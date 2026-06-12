@@ -114,9 +114,29 @@ def validate_artifact(
 
     metrics = {
         "ppl_wikitext": _finite_metric(raw_metrics, "ppl_wikitext"),
-        "ppl_mmlu_acc": _finite_metric(raw_metrics, "ppl_mmlu_acc"),
-        "end_kl": _finite_metric(raw_metrics, "end_kl"),
     }
+    raw_end_kl = raw_metrics.get("end_kl")
+    if raw_end_kl is None:
+        raise KeyError("validation backend did not return 'end_kl'")
+    end_kl_value = float(raw_end_kl)
+    skip_end_kl = os.environ.get(
+        "PRISMAQUANT_VALIDATION_SKIP_END_KL", "0"
+    ) not in ("", "0", "false", "False")
+    if math.isnan(end_kl_value) and skip_end_kl:
+        metrics["end_kl"] = end_kl_value
+    else:
+        metrics["end_kl"] = _finite_metric(raw_metrics, "end_kl")
+    # MMLU is skippable via n_mmlu_questions=0 → backend returns NaN.
+    # Treat NaN as "metric intentionally omitted" so a partial survey is
+    # still useful for the metrics that *were* requested.
+    raw_mmlu = raw_metrics.get("ppl_mmlu_acc")
+    if raw_mmlu is None:
+        raise KeyError("validation backend did not return 'ppl_mmlu_acc'")
+    mmlu_value = float(raw_mmlu)
+    if math.isnan(mmlu_value) and int(n_mmlu_questions) <= 0:
+        metrics["ppl_mmlu_acc"] = mmlu_value  # explicit-skip sentinel
+    else:
+        metrics["ppl_mmlu_acc"] = _finite_metric(raw_metrics, "ppl_mmlu_acc")
     metrics["model_sha"] = _sha256_model_reference(model_path)
     metrics["layer_config_sha"] = config_sha
     metrics["eval_seconds"] = float(time.monotonic() - started)
@@ -213,18 +233,21 @@ def _compute_metrics(
                 n_questions=n_mmlu_questions,
                 progress=progress,
             )
-        end_kl = _end_kl(
-            model=model,
-            tokenizer=tokenizer,
-            load_dataset=load_dataset,
-            assignment=assignment,
-            cache_dir=cache_dir,
-            device=torch_device,
-            calib_seqlen=calib_seqlen,
-            calib_n_samples=calib_n_samples,
-            cal_hash=cal_hash,
-            progress=progress,
-        )
+        if os.environ.get("PRISMAQUANT_VALIDATION_SKIP_END_KL", "0") not in ("", "0", "false", "False"):
+            end_kl = float("nan")
+        else:
+            end_kl = _end_kl(
+                model=model,
+                tokenizer=tokenizer,
+                load_dataset=load_dataset,
+                assignment=assignment,
+                cache_dir=cache_dir,
+                device=torch_device,
+                calib_seqlen=calib_seqlen,
+                calib_n_samples=calib_n_samples,
+                cal_hash=cal_hash,
+                progress=progress,
+            )
     return {
         "ppl_wikitext": float(ppl_wikitext),
         "ppl_mmlu_acc": float(ppl_mmlu_acc),
@@ -262,12 +285,26 @@ def _perturbed_model(
         return
     from .perturbed_x_cache import PerturbedActivationCache
 
+    prod_cache_obj = None
+    prod_cache_path = os.environ.get("PRISMAQUANT_VALIDATION_PROD_CACHE")
+    if prod_cache_path:
+        import pickle as _pickle
+        with open(prod_cache_path, "rb") as _fh:
+            prod_cache_obj = _pickle.load(_fh)
+        override_dir = os.environ.get("PRISMAQUANT_VALIDATION_PROD_CACHE_DIR")
+        if override_dir and hasattr(prod_cache_obj, "relocate"):
+            prod_cache_obj.relocate(override_dir)
+        lru_gb = float(os.environ.get("PRISMAQUANT_VALIDATION_PROD_CACHE_LRU_GB", "16"))
+        if lru_gb > 0 and hasattr(prod_cache_obj, "enable_lru"):
+            prod_cache_obj.enable_lru(int(lru_gb * 1024**3))
+
     hooks = PerturbedActivationCache(
         model,
         active,
         cache_dir / "validation_perturbed_hooks",
         input_rows=0,
         cal_hash=cal_hash,
+        production_weight_cache=prod_cache_obj,
     )
     if hooks.missing:
         preview = ", ".join(hooks.missing[:8])
@@ -332,7 +369,16 @@ def _wikitext_ppl(
     if seq_len < 2:
         raise ValueError("WikiText tokenization produced fewer than two tokens")
 
-    stride = min(_model_context_length(model, tokenizer), 2048, seq_len)
+    max_stride = 2048
+    raw_stride = os.environ.get("PRISMAQUANT_VALIDATION_WIKITEXT_STRIDE")
+    if raw_stride:
+        try:
+            max_stride = max(2, int(raw_stride))
+        except ValueError as exc:
+            raise ValueError(
+                "PRISMAQUANT_VALIDATION_WIKITEXT_STRIDE must be an integer"
+            ) from exc
+    stride = min(_model_context_length(model, tokenizer), max_stride, seq_len)
     stride = max(int(stride), 2)
     nll_sum = 0.0
     token_count = 0
@@ -362,6 +408,13 @@ def _wikitext_ppl(
         nll_sum += float(loss.detach().float().item()) * float(trg_len)
         token_count += int(trg_len)
         prev_end = end
+        del loss, labels, window
+        if getattr(device, "type", None) == "cuda":
+            import gc
+            import torch
+
+            gc.collect()
+            torch.cuda.empty_cache()
         if end >= seq_len:
             break
     if token_count <= 0:
@@ -377,12 +430,21 @@ def _load_wikitext_ids(
     split: str,
     n_tokens: int | None = None,
 ):
-    ds = load_dataset(
-        "wikitext",
-        "wikitext-2-raw-v1",
-        split=split,
-        cache_dir=str(cache_dir / "datasets"),
-    )
+    last_error: Exception | None = None
+    for dataset_name in ("Salesforce/wikitext", "wikitext"):
+        try:
+            ds = load_dataset(
+                dataset_name,
+                "wikitext-2-raw-v1",
+                split=split,
+                cache_dir=str(cache_dir / "datasets"),
+            )
+            break
+        except Exception as exc:
+            last_error = exc
+    else:
+        assert last_error is not None
+        raise last_error
     text = "\n\n".join(row["text"] for row in ds if row.get("text", "").strip())
     enc = tokenizer(text, return_tensors="pt", add_special_tokens=False)
     ids = enc.input_ids
@@ -401,6 +463,10 @@ def _mmlu_accuracy(
     n_questions: int,
     progress: bool,
 ) -> float:
+    if int(n_questions) <= 0:
+        # Caller opted out of MMLU. Return NaN so downstream metric handling
+        # treats it as missing instead of failing on a zero-question loop.
+        return float("nan")
     rows = _load_mmlu_rows(load_dataset, cache_dir)
     questions = _select_diverse_mmlu(rows, int(n_questions))
     if not questions:
@@ -736,7 +802,7 @@ def _entry_format_name(entry: Any) -> str | None:
             elt = str(entry.get("weight_element_dtype", "fp8_e4m3")).lower()
             if elt == "fp8_e5m2":
                 return "MXFP8_E5M2" if act_bits == 8 else None
-            return "MXFP8" if act_bits == 8 else "MXFP8A16"
+            return "MXFP8_E4M3" if act_bits == 8 else "MXFP8A16"
     if data_type == "int":
         if bits == 8:
             return "INT8_W8A16"

@@ -7,7 +7,10 @@ import torch
 import torch.nn as nn
 
 from prismaquant import format_registry as fr
-from prismaquant.allocator_candidates import _scan_source_dtype_manifest
+from prismaquant.allocator_candidates import (
+    _scan_source_dtype_manifest,
+    cost_entry_source,
+)
 from prismaquant.allocator import (
     Candidate,
     build_candidates,
@@ -30,6 +33,14 @@ class TestPrismaQuantFormatRegistry(unittest.TestCase):
         self.assertEqual(fr.canonical_format_name("MXFP8"), "MXFP8_E4M3")
         self.assertEqual(fr.get_format("MXFP8").name, "MXFP8_E4M3")
         self.assertIn("MXFP8", fr.aliases_for("MXFP8_E4M3"))
+
+    def test_fp8_dynamic_alias_targets_vllm_dynamic_fp8(self):
+        self.assertEqual(fr.canonical_format_name("FP8_DYNAMIC"), "FP8_E4M3")
+        self.assertEqual(fr.canonical_format_name("FP8"), "FP8_E4M3")
+        self.assertEqual(fr.canonical_format_name("fp8_dynamic"), "FP8_E4M3")
+        self.assertEqual(fr.get_format("FP8_DYNAMIC").name, "FP8_E4M3")
+        self.assertEqual(fr.get_format("fp8_dynamic").name, "FP8_E4M3")
+        self.assertIn("FP8_DYNAMIC", fr.aliases_for("FP8_E4M3"))
 
     def test_low_bit_custom_kernel_formats_are_not_registered(self):
         for name in ("INT2", "INT3", "NVINT2", "NVINT3", "NVFP3"):
@@ -131,7 +142,33 @@ class TestPrismaQuantAllocatorMath(unittest.TestCase):
             clear=True,
         ):
             cands = build_candidates(stats, costs, [fr.get_format("FP8_E4M3")])
-        self.assertAlmostEqual(cands["layer.weight"][0].predicted_dloss, 0.05)
+            self.assertAlmostEqual(cands["layer.weight"][0].predicted_dloss, 0.05)
+
+    def test_cost_entry_source_reports_authoritative_fallback(self):
+        stats = {"h_trace": 2.0, "num_experts": 1}
+
+        self.assertEqual(
+            cost_entry_source(stats, {"output_mse": 0.25}),
+            "output_mse",
+        )
+        self.assertEqual(
+            cost_entry_source(
+                stats,
+                {
+                    "output_mse": 0.0,
+                    "output_mse_measured": False,
+                    "predicted_dloss": 7.0,
+                },
+            ),
+            "predicted_dloss",
+        )
+        self.assertEqual(
+            cost_entry_source(
+                stats,
+                {"predicted_dloss": 3.0, "cost_source": "grouped_kl_share"},
+            ),
+            "grouped_kl_share",
+        )
 
     def test_build_candidates_prices_source_fp8_below_mxfp8(self):
         stats = {
@@ -339,7 +376,7 @@ class TestPrismaQuantAllocatorMath(unittest.TestCase):
 
         self.assertEqual(
             [c.fmt for c in filtered[name]],
-            ["NVFP4", "MXFP8", "MXFP8_E4M3", "MXFP4", "BF16"],
+            ["NVFP4", "MXFP8", "MXFP8_E4M3", "MXFP4", "FP8_E4M3", "BF16"],
         )
         self.assertNotIn("model.layers.0.self_attn.q_proj", filtered)
 

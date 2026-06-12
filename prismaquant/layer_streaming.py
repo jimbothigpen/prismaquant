@@ -32,6 +32,7 @@ except ModuleNotFoundError:
         device,
         *,
         value: torch.Tensor | None = None,
+        dtype: torch.dtype | None = None,
     ) -> None:
         if "." in tensor_name:
             parent_name, attr = tensor_name.rsplit(".", 1)
@@ -51,6 +52,8 @@ except ModuleNotFoundError:
                 )
             else:
                 target = value if value.device == target_device else value.to(target_device)
+                if dtype is not None and target.is_floating_point():
+                    target = target.to(dtype)
             parent._parameters[attr] = nn.Parameter(
                 target,
                 requires_grad=bool(getattr(old, "requires_grad", False)),
@@ -68,6 +71,8 @@ except ModuleNotFoundError:
                 )
             else:
                 target = value if value.device == target_device else value.to(target_device)
+                if dtype is not None and target.is_floating_point():
+                    target = target.to(dtype)
             parent._buffers[attr] = target
             return
         raise AttributeError(f"{tensor_name!r} is not a parameter or buffer")
@@ -411,9 +416,141 @@ def _materialize(model: nn.Module, prefixes: list[str],
         _apply_fp8_dequant_inplace(out, fp8_scale_inv_map, device)
     loaded = 0
     for model_name, t in out.items():
-        set_module_tensor_to_device(model, model_name, device, value=t)
+        install_dtype = t.dtype if t.is_floating_point() else None
+        set_module_tensor_to_device(
+            model, model_name, device, value=t, dtype=install_dtype)
         loaded += 1
     return loaded
+
+
+def _pack_per_expert_into_packed(
+    out: dict[str, torch.Tensor],
+    *,
+    per_expert_re: "re.Pattern",
+    parent_for_projection,
+    projection_names_for,
+    live_param_shape,
+) -> int:
+    """Stack per-expert checkpoint tensors into packed 3D live params.
+
+    Some MoE checkpoints store each routed expert's projections separately
+    on disk (``…experts.{i}.{proj}.weight``) while the live module exposes a
+    single packed parameter per projection group (``…experts.gate_up_proj``,
+    a ``[num_experts, …]`` tensor). The install resolver is keyed by the
+    *live* parameter names, so the per-expert disk tensors never match and
+    the slow fallback walks a non-existent ``experts.{i}`` submodule.
+
+    This bridges the two layouts generically: every structural decision —
+    which projections fuse into which packed param, and in what order —
+    comes from the supplied callables, which the caller wires from the model
+    profile's packed-experts spec. No architecture names appear here. The
+    assembled tensor's shape is checked against the live parameter so a
+    layout mismatch fails loud instead of silently mis-packing.
+
+    Mutates ``out`` in place: removes consumed per-expert keys and inserts
+    the packed keys. Returns the number of packed params produced (0 = the
+    checkpoint isn't per-expert, or the live module isn't packed)."""
+    # packed_full_name -> {expert_idx -> {projection -> tensor}}
+    groups: dict[str, dict[int, dict[str, torch.Tensor]]] = defaultdict(
+        lambda: defaultdict(dict))
+    consumed: list[str] = []
+    for key, t in out.items():
+        name = key[:-len(".weight")] if key.endswith(".weight") else key
+        if not per_expert_re.match(name):
+            continue
+        head, proj = name.rsplit(".", 1)           # head = …experts.{idx}
+        experts_path, idx_str = head.rsplit(".", 1)
+        if not idx_str.isdigit():
+            continue
+        parent = parent_for_projection(proj)
+        if parent is None:
+            continue
+        packed_full = f"{experts_path}.{parent}"
+        if live_param_shape(packed_full) is None:
+            continue  # live module isn't packed for this group — leave as-is
+        groups[packed_full][int(idx_str)][proj] = t
+        consumed.append(key)
+    produced = 0
+    for packed_full, by_expert in groups.items():
+        parent = packed_full.rsplit(".", 1)[1]
+        order = tuple(projection_names_for(parent))
+        n_experts = max(by_expert) + 1
+        slabs: list[torch.Tensor] = []
+        for i in range(n_experts):
+            projs = by_expert.get(i)
+            if projs is None or any(p not in projs for p in order):
+                raise ValueError(
+                    f"per-expert pack: {packed_full} missing expert {i} "
+                    f"projection(s) {order}")
+            if len(order) == 1:
+                slabs.append(projs[order[0]])
+            else:
+                # Fuse projections along the output axis (the transformers
+                # packed-FusedMoE convention), then stack experts on a new
+                # leading axis. The shape check below is the safety net.
+                slabs.append(torch.cat([projs[p] for p in order], dim=0))
+        packed = torch.stack(slabs, dim=0).contiguous()
+        target = live_param_shape(packed_full)
+        if tuple(packed.shape) != tuple(target):
+            raise ValueError(
+                f"per-expert pack: assembled {packed_full} shape "
+                f"{tuple(packed.shape)} != live param {tuple(target)}")
+        out[packed_full] = packed
+        produced += 1
+    for key in consumed:
+        out.pop(key, None)
+    return produced
+
+
+def _build_expert_packer(model: nn.Module, weight_ckpt: dict[str, str]):
+    """Return a callable that packs per-expert checkpoint tensors into the
+    live module's packed 3D params, or None when not needed.
+
+    Returns None (loader unchanged) unless ALL of:
+      * the model profile declares packed-expert params + a per-expert regex,
+      * the checkpoint actually stores experts per-expert on disk, and
+      * the live module exposes the packed params (so there is a layout gap
+        to bridge — a per-expert *live* layout needs no packing).
+
+    Everything model-specific comes from the profile spec; the returned
+    closure carries no architecture names. Used by both the streaming
+    probe/cost context and the compressed-tensors exporter so a raw
+    per-expert checkpoint loads identically on every path — no out-of-band
+    pre-pack."""
+    try:
+        from .model_profiles import profile_from_model
+        prof = profile_from_model(model)
+    except Exception:
+        return None
+    packed_names = prof.packed_expert_param_names()
+    regex = prof.per_expert_moe_regex()
+    if not packed_names or not regex:
+        return None
+    pat = re.compile(regex[len("re:"):] if regex.startswith("re:") else regex)
+
+    def _is_per_expert(k: str) -> bool:
+        name = k[:-len(".weight")] if k.endswith(".weight") else k
+        return bool(pat.match(name))
+
+    if not any(_is_per_expert(k) for k in weight_ckpt):
+        return None  # checkpoint already packed — nothing to do
+    live_shapes = {
+        n: tuple(p.shape) for n, p in model.named_parameters()
+        if n.rsplit(".", 1)[-1] in packed_names
+    }
+    if not live_shapes:
+        return None  # live module is per-expert too — no gap to bridge
+
+    def _packer(out):
+        _pack_per_expert_into_packed(
+            out,
+            per_expert_re=pat,
+            parent_for_projection=prof.packed_expert_parent_for_projection,
+            projection_names_for=prof.packed_expert_projection_names,
+            live_param_shape=live_shapes.get,
+        )
+
+    return _packer
 
 
 def _read_layer_to_device(prefix: str,
@@ -423,6 +560,7 @@ def _read_layer_to_device(prefix: str,
                           device: torch.device,
                           fp8_scale_inv_map: dict[str, tuple[str, str]]
                               | None = None,
+                          pack_experts=None,
                           ) -> dict[str, torch.Tensor]:
     """Read all tensors under `prefix` from safetensors and place them
     on `device`. Returns {model_name: device_tensor}.
@@ -460,6 +598,11 @@ def _read_layer_to_device(prefix: str,
                 out[model_name] = t
     if fp8_scale_inv_map:
         _apply_fp8_dequant_inplace(out, fp8_scale_inv_map, device)
+    if pack_experts is not None:
+        # Generic per-expert -> packed-3D bridge for checkpoints that ship
+        # MoE experts unfused while the live module is packed. No-op (None)
+        # for every other checkpoint/model. Driven by the model profile.
+        pack_experts(out)
     return out
 
 
@@ -474,7 +617,9 @@ def _install_cached_tensors(model: nn.Module,
                             device: torch.device):
     """Install cached layer tensors into the model on `device`."""
     for model_name, t in cached_tensors.items():
-        set_module_tensor_to_device(model, model_name, device, value=t)
+        install_dtype = t.dtype if t.is_floating_point() else None
+        set_module_tensor_to_device(
+            model, model_name, device, value=t, dtype=install_dtype)
 
 
 def _build_install_resolver(model: nn.Module,
@@ -536,8 +681,13 @@ def _fast_install(resolver: dict[str, tuple],
             # layers are dead weights that transformers' from_pretrained
             # silently ignores. Mirror that here.
             if model is not None:
+                # UNION (sync 2026-06-12): upstream's dtype-aware install
+                # (install_dtype) wrapped in our orphan-tensor skip guard
+                # (66b31b3) — orthogonal concerns at one site.
+                install_dtype = t.dtype if t.is_floating_point() else None
                 try:
-                    set_module_tensor_to_device(model, model_name, device, value=t)
+                    set_module_tensor_to_device(
+                        model, model_name, device, value=t, dtype=install_dtype)
                 except AttributeError as _e:
                     # Orphan: the model class doesn't define this attribute.
                     # Log once per name pattern and skip.
@@ -978,10 +1128,22 @@ def _get_layer_list(model: nn.Module):
 def _get_rotary(base_model: nn.Module) -> nn.Module | None:
     """Find the rotary embedding module so we can compute
     position_embeddings once per sample."""
-    for attr in ("rotary_emb", "rope", "rotary_embedding"):
+    for attr in ("rotary_emb", "rope", "rotary_embedding", "pos_emb"):
         r = getattr(base_model, attr, None)
         if r is not None:
             return r
+    return None
+
+
+def _get_final_norm(base_model: nn.Module) -> nn.Module | None:
+    """Find the final pre-lm_head norm by trying the attribute names used
+    across HF architectures, in priority order: ``norm`` (Llama/Qwen/most),
+    then ``embedding_norm``, ``final_layernorm``, ``final_norm``, and
+    ``ln_f`` (GPT-2 lineage). Returns the first present module, else None."""
+    for attr in ("norm", "embedding_norm", "final_layernorm", "final_norm", "ln_f"):
+        n = getattr(base_model, attr, None)
+        if n is not None:
+            return n
     return None
 
 
@@ -1000,14 +1162,30 @@ def _call_layer(layer: nn.Module, hidden: torch.Tensor, *,
     profile's `extra_layer_kwargs(...)` (e.g. DSv4-Flash hash-routing
     layers consume `input_ids` for the `tid2eid` lookup). Layers that
     don't consume those kwargs ignore them via `**kwargs` absorption.
+
+    When `position_embeddings` is a `{layer_type: (cos, sin)}` dict (produced
+    by `_compute_position_embeddings` for multi-layer-type-rope models like
+    Gemma3/Gemma4), select this layer's entry via its attention `layer_type`
+    so sliding- and full-attention layers each get their own rope.
     """
+    pe = position_embeddings
+    if isinstance(pe, dict):
+        lt = (getattr(layer, "layer_type", None)
+              or getattr(getattr(layer, "self_attn", None), "layer_type", None)
+              or getattr(getattr(layer, "attention", None), "layer_type", None))
+        pe = pe.get(lt)
+        if pe is None:
+            # Unknown/missing layer_type — fall back to any entry rather than
+            # crash (single-type rope, or a layer that doesn't tag its type).
+            # `None` default guards against an empty dict (StopIteration).
+            pe = next(iter(position_embeddings.values()), None)
     out = layer(
         hidden_states=hidden,
         attention_mask=attention_mask,
         position_ids=position_ids,
         past_key_values=past_key_values,
         use_cache=False,
-        position_embeddings=position_embeddings,
+        position_embeddings=pe,
         **extra,
     )
     if isinstance(out, tuple):
@@ -1018,12 +1196,30 @@ def _call_layer(layer: nn.Module, hidden: torch.Tensor, *,
 def _compute_position_embeddings(base_model: nn.Module,
                                  hidden: torch.Tensor,
                                  position_ids: torch.Tensor):
-    """Call the rotary module to get (cos, sin). Returns None if
-    the model doesn't expose a standalone rotary (unusual)."""
+    """Call the rotary module to get position embeddings.
+
+    Single-rope models return a `(cos, sin)` tuple. Multi-layer-type-rope
+    models (Gemma3/Gemma4: separate rope per attention type, e.g.
+    sliding vs full with different `rope_theta`) expose `rotary.layer_types`
+    and a `forward(x, position_ids, layer_type=...)`; for those we return a
+    `{layer_type: (cos, sin)}` dict and `_call_layer` selects the right entry
+    per layer. Returns None if the model exposes no standalone rotary."""
     rotary = _get_rotary(base_model)
     if rotary is None:
         return None
+    layer_types = getattr(rotary, "layer_types", None)
     with torch.no_grad():
+        if layer_types:
+            per_type: dict = {}
+            for lt in layer_types:
+                try:
+                    per_type[lt] = tuple(rotary(hidden, position_ids,
+                                                layer_type=lt))
+                except TypeError:
+                    # Rotary forward doesn't take layer_type (e.g. DSv4 uses
+                    # one rope for all layers) — same embeddings for each.
+                    per_type[lt] = tuple(rotary(hidden, position_ids))
+            return per_type
         cos, sin = rotary(hidden, position_ids)
     return (cos, sin)
 
@@ -1048,9 +1244,11 @@ def _head_prefixes(root: nn.Module, base_prefix: str) -> list[str]:
     """Prefixes for the always-resident pieces: embed + norm + lm_head +
     any rotary/position buffers under the base model.
 
-    Profiles can extend the list via `head_resident_extra_prefixes`
-    (DSv4 adds `model.hc_head.` for the multi-stream→single-stream
-    collapse module)."""
+    Architecture-specific names (e.g. an `embedding_norm` final norm or a
+    `pos_emb` rotary) are contributed by the profile via
+    `head_resident_extra_prefixes`, not hardcoded here (DSv4 adds
+    `model.hc_head.` for the multi-stream→single-stream collapse module;
+    LFM2.5 adds its `embedding_norm`/`pos_emb`)."""
     p = f"{base_prefix}." if base_prefix else ""
     # === embeddings. prefix (NemotronH) ===
     # NemotronH uses `embeddings` instead of `embed_tokens`; include both.

@@ -28,15 +28,18 @@ an environment variable.
 Current V1 production order:
 
 ```text
-NVFP4 scale rule:          FourOverSix
-NVFP4 scale optimizer:     joint_scale_opt
+format scale rule:         FourOverSix (NVFP4 only)
+format scale optimizer:    joint_scale_opt (NVFP4 only)
+rounding solver modifier:  static_act_order (NVFP4, MXFP4, MXFP8)
 rounding solver:           GPTQ
 codebook scale refine:     scale_sweep (explicit ablation only)
 ```
 
 Historical research-only render paths live under `archive/`. V1 production
-defaults use `gptq,joint_scale_opt`; scale_sweep remains available for
-explicit ablations but is not part of the default recipe.
+defaults use `gptq,static_act_order,joint_scale_opt`; static activation
+ordering applies to production microscaling GPTQ formats (NVFP4, MXFP4, and
+MXFP8), while joint scale optimization is NVFP4-only. `scale_sweep` remains
+available for explicit ablations but is not part of the default recipe.
 
 Global basis transforms are excluded from this local sequence; evaluate them
 as separate full-recipe arms.
@@ -47,8 +50,26 @@ also lets FourOverSix participate in downstream GPTQ packages. This catches
 the case where FourOverSix alone is neutral or negative, but FourOverSix plus
 rounding improves the active score.
 
-MXFP8 scale-sweep uses the same progressive gate: if the activation-aware
-candidate regresses the active score, the MXFP8 baseline render is kept.
+MXFP8_E4M3 scale-sweep and the explicit FP8_E4M3/FP8_E5M2 plus
+MXFP8_E4M3/MXFP8_E5M2 GPTQ paths use the same progressive gate: if the
+activation-aware candidate regresses the active score, the baseline render is
+kept.
+
+The pipeline order is shared across formats. Support is format-gated:
+
+- NVFP4 supports FourOverSix, GPTQ, joint_scale_opt, static_act_order, and
+  scale_sweep.
+- FP8_E4M3/FP8_E5M2 support GPTQ; FP8_E4M3 additionally supports dynamic
+  per-row scale_sweep.
+- MXFP4 supports GPTQ and static_act_order with the canonical E8M0 scale
+  rule. MXFP6 remains research-only here because no served export/dequant path
+  is wired yet.
+- MXFP8_E4M3/MXFP8_E5M2 support GPTQ and static_act_order with the canonical
+  E8M0 scale rule. When static_act_order is enabled, the production gate
+  scores both ordinary GPTQ and static-order GPTQ and keeps the lower-score
+  candidate. MXFP8_E4M3 additionally supports E8M0 scale_sweep.
+- Unsupported mechanisms are skipped for that format rather than creating a
+  separate pipeline.
 
 The gate can be disabled only for debugging with
 `PRISMAQUANT_RENDER_PROGRESSIVE_GATES=0`. The minimum relative gain is

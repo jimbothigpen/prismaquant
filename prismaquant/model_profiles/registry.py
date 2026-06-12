@@ -28,6 +28,7 @@ from .base import ModelProfile
 from .default import DefaultProfile
 from .gemma3 import Gemma3Profile
 from .gemma4 import Gemma4Profile
+from .lfm2_moe import Lfm2MoeProfile
 from .qwen3 import Qwen3Profile
 from .qwen3_5 import Qwen3_5Profile
 from .qwen3_5_dense import Qwen3_5DenseProfile
@@ -48,6 +49,7 @@ _REGISTERED: list[type[ModelProfile]] = [
     Qwen3Profile,  # original Qwen3 (dense, no MoE, no MTP) — after the 3.5 siblings
     Gemma3Profile,  # text + SigLIP vision; multi-layer-type rope
     Gemma4Profile,
+    Lfm2MoeProfile,
     MiniMaxM2Profile,
     DeepseekV4Profile,
 ]

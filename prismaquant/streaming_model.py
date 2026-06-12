@@ -59,6 +59,7 @@ except ModuleNotFoundError:
 from .layer_streaming import (
     _build_fp8_scale_inv_map,
     LayerCache,
+    _build_expert_packer,
     _build_install_resolver,
     _build_weight_map,
     _fast_install,
@@ -115,6 +116,33 @@ def _mask_cuda_queries_during_meta_init(log_prefix: str):
     if not enabled or torch.cuda.is_initialized():
         yield
         return
+
+    # Prime transformers' lru_cached fla / causal-conv1d availability checks
+    # with CUDA visible BEFORE masking it. Several modeling files
+    # (Qwen3.5/3.6 MoE, Qwen3-Next, OLMo-hybrid) bind their gated-delta-rule
+    # FAST PATH at *module import time* behind
+    # `if is_flash_linear_attention_available():`. That check is
+    # `@lru_cache`d and CUDA-gated, so if the module is first imported inside
+    # this mask it caches `False`, the fla ops are never imported, and the
+    # fast path is silently lost for the whole process — falling back to the
+    # slow torch gated-delta-rule path (issue #4). Re-priming the caches here
+    # pins them to the real CUDA state so the subsequent masked import still
+    # binds the fast path. No-op when the packages aren't installed; the
+    # availability call is a lightweight `torch.cuda.is_available()` (set
+    # PRISMAQUANT_MASK_CUDA_DURING_META_INIT=0 to skip the mask entirely on a
+    # pathologically-wedged UVM where even that probe is slow).
+    try:
+        from transformers.utils import import_utils as _tiu
+        for _avail in ("is_flash_linear_attention_available",
+                       "is_causal_conv1d_available"):
+            _f = getattr(_tiu, _avail, None)
+            if _f is None:
+                continue
+            if hasattr(_f, "cache_clear"):
+                _f.cache_clear()
+            _f()  # prime with CUDA visible (result cached for the process)
+    except Exception:
+        pass
 
     old_is_available = torch.cuda.is_available
     old_device_count = torch.cuda.device_count
@@ -344,7 +372,8 @@ class StreamingContext:
                  fp8_scale_inv_map: dict[str, tuple[str, str]] | None = None,
                  estimated_layer_bytes: int = 0,
                  prefetch_workers: int = 3,
-                 prefetch_min_available_bytes: int = 0):
+                 prefetch_min_available_bytes: int = 0,
+                 expert_packer=None):
         self.model = model
         self.base_model = base_model
         self.layers = layers
@@ -378,6 +407,11 @@ class StreamingContext:
         # dequanted weights, not raw fp8 codes cast to bf16. Empty dict
         # for BF16-native checkpoints — loader path is unchanged.
         self.fp8_scale_inv_map = fp8_scale_inv_map or {}
+        # Optional per-expert -> packed-3D bridge for checkpoints that ship
+        # MoE experts unfused while the live module is packed. None for
+        # every other checkpoint/model (zero behavior change). Built once
+        # in `_build_streaming_context` from the model profile's spec.
+        self.expert_packer = expert_packer
         self._inflight: dict[int, Any] = {}
         self._inflight_lock = threading.Lock()
         self.configure_runtime_pressure_floor()
@@ -414,7 +448,8 @@ class StreamingContext:
         prefix = f"{self.layers_prefix}{L}."
         tensors = _read_layer_to_device(
             prefix, self.weight_shard, self.weight_ckpt, self.dtype,
-            self.device, fp8_scale_inv_map=self.fp8_scale_inv_map)
+            self.device, fp8_scale_inv_map=self.fp8_scale_inv_map,
+            pack_experts=self.expert_packer)
         # v20 fix #5: prefetch path doesn't force-insert. If the layer
         # exceeds effective budget, the put returns False and the
         # tensors fall out of scope here — ensure_loaded will re-load
@@ -464,7 +499,8 @@ class StreamingContext:
         prefix = f"{self.layers_prefix}{L}."
         tensors = _read_layer_to_device(
             prefix, self.weight_shard, self.weight_ckpt, self.dtype,
-            self.device, fp8_scale_inv_map=self.fp8_scale_inv_map)
+            self.device, fp8_scale_inv_map=self.fp8_scale_inv_map,
+            pack_experts=self.expert_packer)
         self.layer_cache.put(L, tensors)
         return tensors, "cold"
 
@@ -634,6 +670,16 @@ def _find_visual_module(model) -> tuple[Any | None, str]:
     return None, ""
 
 
+def _module_has_meta_tensors(module: nn.Module) -> bool:
+    return any(
+        getattr(t, "is_meta", False)
+        for t in (
+            *module.parameters(recurse=True),
+            *module.buffers(recurse=True),
+        )
+    )
+
+
 def _build_streaming_context(model_path: str, *,
                              device: torch.device, dtype: torch.dtype,
                              offload_folder: str,
@@ -763,8 +809,17 @@ def _build_streaming_context(model_path: str, *,
                 fp8_scale_inv_map=fp8_scale_inv_map)
             print(f"{log_prefix} materializing visual tower: "
                   f"{len(tensors)}/{len(vis_keys)} tensors -> {device}", flush=True)
+            if _module_has_meta_tensors(visual_module):
+                visual_module.to_empty(device=device, recurse=True)
             for model_name, t in tensors.items():
-                set_module_tensor_to_device(model, model_name, device, value=t)
+                install_dtype = t.dtype if t.is_floating_point() else None
+                set_module_tensor_to_device(
+                    model, model_name, device, value=t, dtype=install_dtype)
+            # Some visual towers carry non-checkpoint buffers initialized by
+            # the module constructor. Keep them colocated with checkpoint
+            # tensors before the multimodal streaming probe calls visual
+            # helpers such as get_image_features.
+            visual_module.to(device=device, dtype=dtype)
             if visual_requires_grad:
                 # Enable grad on every Linear's weight + bias so backward
                 # hooks fire on the reverse sweep. Embeddings and norms
@@ -874,4 +929,5 @@ def _build_streaming_context(model_path: str, *,
         estimated_layer_bytes=estimated_layer_bytes,
         prefetch_workers=worker_count,
         prefetch_min_available_bytes=min_available_bytes,
+        expert_packer=_build_expert_packer(model, weight_ckpt),
     )

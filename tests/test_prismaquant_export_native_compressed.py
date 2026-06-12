@@ -10,8 +10,10 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
+import torch.nn as nn
 import prismaquant.export_native_compressed as enc
 
 from prismaquant.allocator import promote_fused
@@ -48,6 +50,54 @@ from prismaquant.export_native_compressed import (
 )
 from prismaquant.model_profiles.qwen3_5 import Qwen3_5Profile
 from prismaquant.model_profiles.gemma4 import Gemma4Profile
+from prismaquant import format_registry as fr
+from prismaquant.layer_streaming import _dequant_fp8_block_weight
+
+
+def _fpquant_gptq_factors_for_test(
+    W: torch.Tensor,
+    X: torch.Tensor,
+    *,
+    damp: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    W_work = W.to(torch.float32).clone()
+    H = X.to(torch.float32).t() @ X.to(torch.float32)
+    diag_mean = torch.diagonal(H).mean().clamp_min(1e-12)
+    H.diagonal().add_(float(damp) * diag_mean)
+    dead = torch.diagonal(H) <= 0
+    if dead.any():
+        H[dead, dead] = 1.0
+        W_work[:, dead] = 0.0
+    L = torch.linalg.cholesky(H)
+    Hinv = torch.cholesky_inverse(L)
+    return W_work, torch.linalg.cholesky(Hinv, upper=True)
+
+
+def _fpquant_columnwise_reference_for_test(
+    W: torch.Tensor,
+    U: torch.Tensor,
+    *,
+    block_size: int,
+    quantize_column,
+) -> torch.Tensor:
+    W_ref = W.to(torch.float32).clone()
+    cols = W_ref.shape[1]
+    for c1 in range(0, cols, block_size):
+        c2 = min(c1 + block_size, cols)
+        ncols = c2 - c1
+        w_blk = W_ref[:, c1:c2].clone()
+        errs = torch.zeros_like(w_blk)
+        U_blk = U[c1:c2, c1:c2]
+        for i in range(ncols):
+            w_ci = w_blk[:, i]
+            w_q = quantize_column(w_ci, c1 + i).to(torch.float32)
+            W_ref[:, c1 + i] = w_q
+            err = (w_ci - w_q) / U_blk[i, i]
+            w_blk[:, i:].addr_(err, U_blk[i, i:], alpha=-1)
+            errs[:, i] = err
+        if c2 < cols:
+            W_ref[:, c2:].addmm_(errs, U[c1:c2, c2:], alpha=-1)
+    return W_ref
 
 
 class _IdentityProfile:
@@ -332,6 +382,60 @@ class TestGroupedExportQuantization(unittest.TestCase):
             _quantize_2d_group_same_shape(weights, "INT3")
 
 
+class _TinyQwenPackedExperts(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.gate_up_proj = nn.Parameter(torch.randn(2, 128, 32))
+        self.down_proj = nn.Parameter(torch.randn(2, 32, 64))
+
+
+class TestPackedExpertExport(unittest.TestCase):
+    def test_mxfp8_split_experts_emit_weight_suffix_for_vllm_loader(self):
+        """Qwen3.5's split expert loader matches
+        `experts.<id>.<proj>.weight`; without the `.weight` suffix raw
+        MXFP8 expert weights fall through to the generic loader and are
+        skipped with "not found in params_dict" warnings.
+        """
+
+        root = nn.Module()
+        root.model = nn.Module()
+        root.model.language_model = nn.Module()
+        layer = nn.Module()
+        layer.mlp = nn.Module()
+        layer.mlp.experts = _TinyQwenPackedExperts()
+        root.model.language_model.layers = nn.ModuleList([layer])
+
+        assignment = {
+            "model.layers.0.mlp.experts.gate_up_proj": "MXFP8_E4M3",
+            "model.layers.0.mlp.experts.down_proj": "MXFP8_E4M3",
+        }
+
+        tensors, hist = enc._materialize_tensors_inmemory(
+            root,
+            assignment,
+            bf16_passthrough=set(),
+            profile=Qwen3_5Profile(),
+        )
+
+        prefix = "model.language_model.layers.0.mlp.experts"
+        expected = {
+            f"{prefix}.0.gate_proj.weight",
+            f"{prefix}.0.gate_proj.weight_scale",
+            f"{prefix}.0.up_proj.weight",
+            f"{prefix}.0.up_proj.weight_scale",
+            f"{prefix}.0.down_proj.weight",
+            f"{prefix}.0.down_proj.weight_scale",
+        }
+        self.assertTrue(expected.issubset(tensors.keys()))
+        self.assertNotIn(f"{prefix}.0.gate_proj", tensors)
+        self.assertNotIn(f"{prefix}.0.up_proj", tensors)
+        self.assertNotIn(f"{prefix}.0.down_proj", tensors)
+        self.assertEqual(
+            hist.get(("packed_moe_per_expert", "MXFP8_E4M3")),
+            2,
+        )
+
+
 def _nvfp4_dequantize(weight_packed, weight_scale_fp8, weight_global_scale_divisor):
     """Reproduce vLLM's NVFP4 dequant convention to verify round-trip.
     The on-disk `weight_global_scale` is `1/global_real`; vLLM inverts
@@ -354,6 +458,26 @@ def _nvfp4_dequantize(weight_packed, weight_scale_fp8, weight_global_scale_divis
     )
     global_real = 1.0 / weight_global_scale_divisor.item()
     return vals * fp8_per_col * global_real
+
+
+def _mxfp4_served_dequantize(weight_packed, weight_scale_e8m0, group_size=32):
+    """Reconstruct MXFP4 as the compressed-tensors/vLLM loader serves it."""
+    rows = weight_packed.shape[0]
+    cols = weight_packed.shape[1] * 2
+    cb = torch.tensor(FLOAT_TO_E2M1, dtype=torch.float32)
+    lo = (weight_packed & 0xF).long()
+    hi = ((weight_packed >> 4) & 0xF).long()
+    idx = torch.stack([lo, hi], dim=-1).reshape(rows, cols)
+    abs_idx = idx & 0x7
+    sign = -((idx >> 3).to(torch.float32) * 2 - 1)
+    vals = sign * cb[abs_idx]
+    scale = torch.pow(2.0, weight_scale_e8m0.to(torch.float32) - 127.0)
+    return vals * scale.repeat_interleave(group_size, dim=1)
+
+
+def _mxfp8_served_dequantize(weight_fp8, weight_scale_e8m0, group_size=32):
+    scale = torch.pow(2.0, weight_scale_e8m0.to(torch.float32) - 127.0)
+    return weight_fp8.float() * scale.repeat_interleave(group_size, dim=1)
 
 
 class TestRoundTrip(unittest.TestCase):
@@ -385,6 +509,129 @@ class TestRoundTrip(unittest.TestCase):
             W.abs().max().item(),
             places=3,
         )
+
+    def test_nvfp4_rtn_dequant_matches_exported_scale_metadata(self):
+        from prismaquant import export_native_compressed as enc
+
+        W = torch.randn(16, 64) * 2.0
+        prev = enc._NVFP4_SCALE_RULE
+        try:
+            enc._NVFP4_SCALE_RULE = enc.NVFP4_SCALE_RULE_STATIC_6
+            wp, ws, wg = quantize_dequantize_nvfp4(W)
+            packed_dequant = _nvfp4_dequantize(wp, ws, wg)
+            helper_dequant = enc._rtn_dequant_nvfp4(W, group_size=16)
+        finally:
+            enc._NVFP4_SCALE_RULE = prev
+
+        torch.testing.assert_close(helper_dequant, packed_dequant)
+
+    def test_registry_served_metadata_reconciliation_covers_all_registered_formats(self):
+        reconciled = {
+            "NVFP4",
+            "NVFP4A16",
+            "MXFP4",
+            "MXFP8_E4M3",
+            "MXFP8_E5M2",
+            "MXFP8A16",
+            "FP8_E4M3",
+            "FP8_E5M2",
+            "BF16",
+            "FP8_SOURCE",
+        }
+        explicit_gaps = {
+            "MXFP6_E3M2": "no vLLM/compressed-tensors served export path is wired yet",
+            "MXFP6_E2M3": "no vLLM/compressed-tensors served export path is wired yet",
+            "INT8_W8A16": "registered allocator research format; no native exporter metadata path",
+            "INT4_W4A16_g128": "registered allocator research format; no native exporter metadata path",
+        }
+        self.assertEqual(set(fr.REGISTRY), reconciled | set(explicit_gaps))
+
+    def test_registry_render_dequant_matches_served_metadata(self):
+        W = torch.randn(8, 128) * 1.75
+        prev = enc._NVFP4_SCALE_RULE
+        try:
+            enc._NVFP4_SCALE_RULE = enc.NVFP4_SCALE_RULE_STATIC_6
+            for fmt in sorted(fr.REGISTRY):
+                with self.subTest(fmt=fmt):
+                    if fmt in {"MXFP6_E3M2", "MXFP6_E2M3", "INT8_W8A16", "INT4_W4A16_g128"}:
+                        continue
+
+                    if fmt in {"NVFP4", "NVFP4A16"}:
+                        wp, ws, wg = quantize_dequantize_nvfp4(W)
+                        served = _nvfp4_dequantize(wp, ws, wg)
+                        rendered = enc._rtn_dequant_nvfp4(W, group_size=16)
+                        torch.testing.assert_close(rendered, served)
+                        continue
+
+                    if fmt == "MXFP4":
+                        out = _quantize_2d(W, "MXFP4")
+                        served = _mxfp4_served_dequantize(
+                            out["weight_packed"],
+                            out["weight_scale"],
+                        )
+                        rendered = enc._mxfp4_grouped_codec(
+                            W.reshape(W.shape[0], W.shape[1] // 32, 32)
+                        ).dequant.reshape_as(W)
+                        torch.testing.assert_close(rendered, served)
+                        continue
+
+                    if fmt in {"MXFP8_E4M3", "MXFP8_E5M2", "MXFP8A16"}:
+                        codec_fmt = "MXFP8_E4M3" if fmt == "MXFP8A16" else fmt
+                        dtype, max_value = enc._fp8_element_dtype_and_max(codec_fmt)
+                        q, s = quantize_dequantize_mxfp8(
+                            W,
+                            element_dtype=dtype,
+                            element_max=max_value,
+                        )
+                        served = _mxfp8_served_dequantize(q, s)
+                        rendered = enc._rtn_dequant_mxfp8(
+                            W,
+                            element_dtype=dtype,
+                            element_max=max_value,
+                        )
+                        torch.testing.assert_close(rendered, served)
+                        continue
+
+                    if fmt in {"FP8_E4M3", "FP8_E5M2"}:
+                        dtype, max_value = enc._fp8_element_dtype_and_max(fmt)
+                        q, s = quantize_dequantize_fp8_dynamic(
+                            W,
+                            element_dtype=dtype,
+                            element_max=max_value,
+                        )
+                        served = q.float() * s
+                        rendered = enc._rtn_dequant_fp8_dynamic(
+                            W,
+                            element_dtype=dtype,
+                            element_max=max_value,
+                        )
+                        torch.testing.assert_close(rendered, served)
+                        continue
+
+                    if fmt == "BF16":
+                        out = _quantize_2d(W, "BF16")
+                        torch.testing.assert_close(
+                            out["weight"].float(),
+                            W.bfloat16().float(),
+                        )
+                        continue
+
+                    if fmt == "FP8_SOURCE":
+                        source_scale = torch.full((1, 1), 0.125, dtype=torch.float32)
+                        source_codes = (W[:128, :128] / source_scale).to(
+                            torch.float8_e4m3fn
+                        )
+                        live_bf16 = _dequant_fp8_block_weight(source_codes, source_scale)
+                        served = source_codes.float() * source_scale
+                        torch.testing.assert_close(
+                            live_bf16.float(),
+                            served.bfloat16().float(),
+                        )
+                        continue
+
+                    self.fail(f"unhandled registered format {fmt}")
+        finally:
+            enc._NVFP4_SCALE_RULE = prev
 
     def test_nvfp4_four_over_six_picks_lower_mse_block_scale(self):
         W = torch.tensor(
@@ -475,6 +722,31 @@ class TestRoundTrip(unittest.TestCase):
         mse = (W - dequant).pow(2).mean().item()
         self.assertLess(mse, 2e-4)
 
+    def test_mx_e8m0_scale_encoding_matches_compressed_tensors_reference(self):
+        try:
+            from compressed_tensors.quantization.utils.mxfp_utils import (
+                generate_mx_scales,
+            )
+        except ModuleNotFoundError:
+            self.skipTest("compressed_tensors is not installed")
+
+        W = torch.randn(8, 64) * 13.0
+        grouped = W.reshape(8, 2, 32)
+
+        mxfp8_scale = enc._mxfp8_grouped_codec(grouped).scale
+        mxfp8_ref = generate_mx_scales(
+            grouped.abs().amax(dim=-1),
+            num_bits=8,
+        ).to(torch.uint8)
+        torch.testing.assert_close(mxfp8_scale, mxfp8_ref, atol=0, rtol=0)
+
+        mxfp4_scale = enc._mxfp4_grouped_codec(grouped).scale
+        mxfp4_ref = generate_mx_scales(
+            grouped.abs().amax(dim=-1),
+            num_bits=4,
+        ).to(torch.uint8)
+        torch.testing.assert_close(mxfp4_scale, mxfp4_ref, atol=0, rtol=0)
+
     def test_mxfp8_packed_3d(self):
         E, M, N = 4, 32, 64
         P = torch.randn(E, M, N) * 0.1
@@ -482,6 +754,421 @@ class TestRoundTrip(unittest.TestCase):
         self.assertEqual(tuple(w.shape), (E, M, N))
         self.assertEqual(tuple(s.shape), (E, M, 2))
         self.assertEqual(s.dtype, torch.uint8)
+
+    def test_fp8_e4m3_gptq_returns_exportable_tensors(self):
+        torch.manual_seed(0)
+        W = torch.randn(4, 32) * 0.1
+        X = torch.randn(12, 32)
+        q, s, dq = enc._gptq_obs_rounding_fp8_like(
+            W,
+            X,
+            fmt="FP8_E4M3",
+            damp=0.01,
+        )
+        self.assertEqual(q.dtype, torch.float8_e4m3fn)
+        self.assertEqual(tuple(q.shape), tuple(W.shape))
+        self.assertEqual(tuple(s.shape), (4, 1))
+        self.assertEqual(tuple(dq.shape), tuple(W.shape))
+        self.assertTrue(torch.allclose(dq, q.float() * s))
+
+    def test_mxfp8_e5m2_gptq_ignores_joint_scale_opt(self):
+        torch.manual_seed(0)
+        W = torch.randn(4, 32) * 0.1
+        X = torch.randn(12, 32)
+        q, s, dq = enc._gptq_obs_rounding_fp8_like(
+            W,
+            X,
+            fmt="MXFP8_E5M2",
+            damp=0.01,
+            joint_scale_opt=True,
+        )
+        q_ref, s_ref, dq_ref = enc._gptq_obs_rounding_fp8_like(
+            W,
+            X,
+            fmt="MXFP8_E5M2",
+            damp=0.01,
+            joint_scale_opt=False,
+        )
+        self.assertEqual(q.dtype, torch.float8_e5m2)
+        self.assertEqual(tuple(q.shape), tuple(W.shape))
+        self.assertEqual(tuple(s.shape), (4, 1))
+        self.assertEqual(s.dtype, torch.uint8)
+        self.assertTrue(torch.equal(q, q_ref))
+        self.assertTrue(torch.equal(s, s_ref))
+        self.assertTrue(torch.equal(dq, dq_ref))
+        scales = torch.pow(2.0, s.to(torch.float32) - 127.0)
+        self.assertTrue(torch.allclose(dq, q.float() * scales.repeat_interleave(32, dim=1)))
+
+    def test_nvfp4_gptq_matches_fpquant_column_update(self):
+        torch.manual_seed(11)
+        W = torch.randn(3, 16) * 0.1
+        X = torch.randn(20, 16)
+        group_size = 4
+        damp = 0.01
+        block_size = 7
+
+        X_gptq = enc._activation_matrix_for_gptq(X, W.shape[1], device=W.device)
+        W_work, U = _fpquant_gptq_factors_for_test(W, X_gptq, damp=damp)
+        grouped = W_work.reshape(W.shape[0], W.shape[1] // group_size, group_size)
+        s_g_real = enc._select_nvfp4_group_scales(grouped)
+        global_real = (s_g_real.amax() / enc.FP8_E4M3_MAX).clamp_min(1e-12)
+        scale_by_col = enc._nvfp4_effective_scale_from_real(
+            s_g_real,
+            global_real,
+            quantize_fp8=True,
+        ).repeat_interleave(group_size, dim=1)
+
+        def quantize_column(col, col_idx):
+            _idx, dq = enc._nvfp4_quantize_dequantize_with_eff_scale(
+                col.unsqueeze(1),
+                scale_by_col[:, col_idx:col_idx + 1],
+            )
+            return dq.squeeze(1)
+
+        expected = _fpquant_columnwise_reference_for_test(
+            W_work,
+            U,
+            block_size=block_size,
+            quantize_column=quantize_column,
+        )
+        with patch.dict("os.environ", {"PRISMAQUANT_GPTQ_BLOCK_SIZE": str(block_size)}):
+            actual = enc._gptq_obs_rounding_nvfp4(
+                W,
+                X,
+                group_size=group_size,
+                damp=damp,
+                static_act_order=False,
+                joint_scale_opt=False,
+            )
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+    def test_fp8_gptq_matches_fpquant_column_update(self):
+        torch.manual_seed(12)
+        W = torch.randn(3, 16) * 0.1
+        X = torch.randn(20, 16)
+        damp = 0.01
+        block_size = 7
+
+        X_gptq = enc._activation_matrix_for_gptq(X, W.shape[1], device=W.device)
+        W_work, U = _fpquant_gptq_factors_for_test(W, X_gptq, damp=damp)
+        scale = enc._fp8_dynamic_codec(W).scale
+        q_ref = torch.empty_like(W, dtype=torch.float8_e4m3fn)
+
+        def quantize_column(col, col_idx):
+            q_col, dq = enc._fp8_quantize_dequantize_with_scale(
+                col.unsqueeze(1),
+                scale,
+                element_dtype=torch.float8_e4m3fn,
+                element_max=enc.FP8_E4M3_MAX,
+            )
+            q_ref[:, col_idx] = q_col.squeeze(1)
+            return dq.squeeze(1)
+
+        expected = _fpquant_columnwise_reference_for_test(
+            W_work,
+            U,
+            block_size=block_size,
+            quantize_column=quantize_column,
+        )
+        with patch.dict("os.environ", {"PRISMAQUANT_GPTQ_BLOCK_SIZE": str(block_size)}):
+            q, s, dq = enc._gptq_obs_rounding_fp8_like(
+                W,
+                X,
+                fmt="FP8_E4M3",
+                damp=damp,
+            )
+        self.assertTrue(torch.equal(q, q_ref))
+        torch.testing.assert_close(s, scale, atol=0, rtol=0)
+        torch.testing.assert_close(dq, expected, atol=0, rtol=0)
+
+    def test_mxfp8_gptq_matches_fpquant_column_update(self):
+        torch.manual_seed(13)
+        W = torch.randn(3, 16) * 0.1
+        X = torch.randn(20, 16)
+        group_size = 4
+        damp = 0.01
+        block_size = 7
+
+        X_gptq = enc._activation_matrix_for_gptq(X, W.shape[1], device=W.device)
+        W_work, U = _fpquant_gptq_factors_for_test(W, X_gptq, damp=damp)
+        scale = torch.empty((W.shape[0], W.shape[1] // group_size), dtype=torch.uint8)
+        for group_idx, block_start in enumerate(range(0, W.shape[1], group_size)):
+            _q_block, scale_block, _dq = enc._mxfp8_quantize_dequantize_block(
+                W[:, block_start:block_start + group_size],
+                col_importance=None,
+                joint_scale_opt=False,
+                element_dtype=torch.float8_e4m3fn,
+                element_max=enc.MXFP8_E4M3_MAX,
+            )
+            scale[:, group_idx] = scale_block
+        scale_by_col = enc.e8m0_to_scale(scale).repeat_interleave(
+            group_size,
+            dim=1,
+        )
+        q_ref = torch.empty_like(W, dtype=torch.float8_e4m3fn)
+
+        def quantize_column(col, col_idx):
+            q_col, dq = enc._fp8_quantize_dequantize_with_scale(
+                col.unsqueeze(1),
+                scale_by_col[:, col_idx:col_idx + 1],
+                element_dtype=torch.float8_e4m3fn,
+                element_max=enc.MXFP8_E4M3_MAX,
+            )
+            q_ref[:, col_idx] = q_col.squeeze(1)
+            return dq.squeeze(1)
+
+        _expected_w = _fpquant_columnwise_reference_for_test(
+            W_work,
+            U,
+            block_size=block_size,
+            quantize_column=quantize_column,
+        )
+        expected_dq = enc._mxfp8_dequantize_2d(q_ref, scale, group_size=group_size)
+        with patch.dict("os.environ", {"PRISMAQUANT_GPTQ_BLOCK_SIZE": str(block_size)}):
+            q, s, dq = enc._gptq_obs_rounding_fp8_like(
+                W,
+                X,
+                fmt="MXFP8_E4M3",
+                group_size=group_size,
+                damp=damp,
+            )
+        self.assertTrue(torch.equal(q, q_ref))
+        self.assertTrue(torch.equal(s, scale))
+        torch.testing.assert_close(_expected_w, expected_dq, atol=0, rtol=0)
+        torch.testing.assert_close(dq, expected_dq, atol=0, rtol=0)
+        scales = torch.pow(2.0, s.to(torch.float32) - 127.0)
+        self.assertTrue(torch.allclose(dq, q.float() * scales.repeat_interleave(group_size, dim=1)))
+
+    def test_mxfp8_gptq_static_act_order_restores_export_order(self):
+        torch.manual_seed(14)
+        W = torch.randn(3, 16) * 0.1
+        X = torch.randn(20, 16)
+        group_size = 4
+        damp = 0.01
+        block_size = 7
+
+        X_gptq = enc._activation_matrix_for_gptq(X, W.shape[1], device=W.device)
+        W_work = W.to(torch.float32).clone()
+        H = X_gptq.to(torch.float32).t() @ X_gptq.to(torch.float32)
+        diag_mean = torch.diagonal(H).mean().clamp_min(1e-12)
+        H.diagonal().add_(float(damp) * diag_mean)
+        dead = torch.diagonal(H) <= 0
+        if dead.any():
+            H[dead, dead] = 1.0
+            W_work[:, dead] = 0.0
+        col_importance = torch.diagonal(H).detach().clone().clamp_min(1e-12)
+
+        scale = torch.empty((W.shape[0], W.shape[1] // group_size), dtype=torch.uint8)
+        for group_idx, block_start in enumerate(range(0, W.shape[1], group_size)):
+            _q_block, scale_block, _dq = enc._mxfp8_quantize_dequantize_block(
+                W_work[:, block_start:block_start + group_size],
+                col_importance=col_importance[block_start:block_start + group_size],
+                joint_scale_opt=False,
+                element_dtype=torch.float8_e4m3fn,
+                element_max=enc.MXFP8_E4M3_MAX,
+            )
+            scale[:, group_idx] = scale_block
+        scale_by_col = enc.e8m0_to_scale(scale).repeat_interleave(
+            group_size,
+            dim=1,
+        )
+
+        perm = torch.argsort(col_importance, descending=True)
+        inverse_perm = torch.empty_like(perm)
+        inverse_perm[perm] = torch.arange(W.shape[1], device=W.device)
+        W_perm = W_work.index_select(1, perm).contiguous()
+        H_perm = H.index_select(0, perm).index_select(1, perm).contiguous()
+        L = torch.linalg.cholesky(H_perm)
+        Hinv = torch.cholesky_inverse(L)
+        U = torch.linalg.cholesky(Hinv, upper=True)
+        scale_by_perm_col = scale_by_col.index_select(1, perm).contiguous()
+        q_perm = torch.empty_like(W, dtype=torch.float8_e4m3fn)
+
+        def quantize_column(col, col_idx):
+            q_col, dq = enc._fp8_quantize_dequantize_with_scale(
+                col.unsqueeze(1),
+                scale_by_perm_col[:, col_idx:col_idx + 1],
+                element_dtype=torch.float8_e4m3fn,
+                element_max=enc.MXFP8_E4M3_MAX,
+            )
+            q_perm[:, col_idx] = q_col.squeeze(1)
+            return dq.squeeze(1)
+
+        _expected_perm_w = _fpquant_columnwise_reference_for_test(
+            W_perm,
+            U,
+            block_size=block_size,
+            quantize_column=quantize_column,
+        )
+        expected_q = q_perm.index_select(1, inverse_perm).contiguous()
+        expected_dq = enc._mxfp8_dequantize_2d(
+            expected_q,
+            scale,
+            group_size=group_size,
+        )
+        with patch.dict("os.environ", {"PRISMAQUANT_GPTQ_BLOCK_SIZE": str(block_size)}):
+            q, s, dq = enc._gptq_obs_rounding_fp8_like(
+                W,
+                X,
+                fmt="MXFP8_E4M3",
+                group_size=group_size,
+                damp=damp,
+                static_act_order=True,
+            )
+        self.assertTrue(torch.equal(q, expected_q))
+        self.assertTrue(torch.equal(s, scale))
+        torch.testing.assert_close(dq, expected_dq, atol=0, rtol=0)
+
+    def test_mxfp4_gptq_matches_fpquant_column_update(self):
+        torch.manual_seed(16)
+        W = torch.randn(3, 16) * 0.1
+        X = torch.randn(20, 16)
+        group_size = 4
+        damp = 0.01
+        block_size = 7
+
+        X_gptq = enc._activation_matrix_for_gptq(X, W.shape[1], device=W.device)
+        W_work, U = _fpquant_gptq_factors_for_test(W, X_gptq, damp=damp)
+        scale = torch.empty((W.shape[0], W.shape[1] // group_size), dtype=torch.uint8)
+        for group_idx, block_start in enumerate(range(0, W.shape[1], group_size)):
+            codec = enc._mxfp4_grouped_codec(
+                W_work[:, block_start:block_start + group_size]
+            )
+            scale[:, group_idx] = codec.scale
+        scale_by_col = enc.e8m0_to_scale(scale).repeat_interleave(
+            group_size,
+            dim=1,
+        )
+        idx_ref = torch.empty_like(W, dtype=torch.uint8)
+
+        def quantize_column(col, col_idx):
+            idx_col, dq = enc._nvfp4_quantize_dequantize_with_eff_scale(
+                col.unsqueeze(1),
+                scale_by_col[:, col_idx:col_idx + 1],
+            )
+            idx_ref[:, col_idx] = idx_col.squeeze(1)
+            return dq.squeeze(1)
+
+        _expected_w = _fpquant_columnwise_reference_for_test(
+            W_work,
+            U,
+            block_size=block_size,
+            quantize_column=quantize_column,
+        )
+        expected_q = pack_fp4_indices(idx_ref, W.shape[1])
+        expected_dq = enc._mxfp4_dequantize_2d(
+            expected_q,
+            scale,
+            group_size=group_size,
+        )
+        with patch.dict("os.environ", {"PRISMAQUANT_GPTQ_BLOCK_SIZE": str(block_size)}):
+            q, s, dq = enc._gptq_obs_rounding_mxfp4(
+                W,
+                X,
+                group_size=group_size,
+                damp=damp,
+            )
+        self.assertTrue(torch.equal(q, expected_q))
+        self.assertTrue(torch.equal(s, scale))
+        torch.testing.assert_close(_expected_w, expected_dq, atol=0, rtol=0)
+        torch.testing.assert_close(dq, expected_dq, atol=0, rtol=0)
+
+    def test_mxfp4_gptq_static_act_order_restores_export_order(self):
+        torch.manual_seed(17)
+        W = torch.randn(3, 16) * 0.1
+        X = torch.randn(20, 16)
+        group_size = 4
+        damp = 0.01
+        block_size = 7
+
+        X_gptq = enc._activation_matrix_for_gptq(X, W.shape[1], device=W.device)
+        W_work = W.to(torch.float32).clone()
+        H = X_gptq.to(torch.float32).t() @ X_gptq.to(torch.float32)
+        diag_mean = torch.diagonal(H).mean().clamp_min(1e-12)
+        H.diagonal().add_(float(damp) * diag_mean)
+        dead = torch.diagonal(H) <= 0
+        if dead.any():
+            H[dead, dead] = 1.0
+            W_work[:, dead] = 0.0
+        col_importance = torch.diagonal(H).detach().clone().clamp_min(1e-12)
+
+        scale = torch.empty((W.shape[0], W.shape[1] // group_size), dtype=torch.uint8)
+        for group_idx, block_start in enumerate(range(0, W.shape[1], group_size)):
+            codec = enc._mxfp4_grouped_codec(
+                W_work[:, block_start:block_start + group_size]
+            )
+            scale[:, group_idx] = codec.scale
+        scale_by_col = enc.e8m0_to_scale(scale).repeat_interleave(
+            group_size,
+            dim=1,
+        )
+
+        perm = torch.argsort(col_importance, descending=True)
+        inverse_perm = torch.empty_like(perm)
+        inverse_perm[perm] = torch.arange(W.shape[1], device=W.device)
+        W_perm = W_work.index_select(1, perm).contiguous()
+        H_perm = H.index_select(0, perm).index_select(1, perm).contiguous()
+        L = torch.linalg.cholesky(H_perm)
+        Hinv = torch.cholesky_inverse(L)
+        U = torch.linalg.cholesky(Hinv, upper=True)
+        scale_by_perm_col = scale_by_col.index_select(1, perm).contiguous()
+        idx_perm = torch.empty_like(W, dtype=torch.uint8)
+
+        def quantize_column(col, col_idx):
+            idx_col, dq = enc._nvfp4_quantize_dequantize_with_eff_scale(
+                col.unsqueeze(1),
+                scale_by_perm_col[:, col_idx:col_idx + 1],
+            )
+            idx_perm[:, col_idx] = idx_col.squeeze(1)
+            return dq.squeeze(1)
+
+        _expected_perm_w = _fpquant_columnwise_reference_for_test(
+            W_perm,
+            U,
+            block_size=block_size,
+            quantize_column=quantize_column,
+        )
+        expected_idx = idx_perm.index_select(1, inverse_perm).contiguous()
+        expected_q = pack_fp4_indices(expected_idx, W.shape[1])
+        expected_dq = enc._mxfp4_dequantize_2d(
+            expected_q,
+            scale,
+            group_size=group_size,
+        )
+        expected_w = _expected_perm_w.index_select(1, inverse_perm).contiguous()
+        with patch.dict("os.environ", {"PRISMAQUANT_GPTQ_BLOCK_SIZE": str(block_size)}):
+            q, s, dq = enc._gptq_obs_rounding_mxfp4(
+                W,
+                X,
+                group_size=group_size,
+                damp=damp,
+                static_act_order=True,
+            )
+        self.assertTrue(torch.equal(q, expected_q))
+        self.assertTrue(torch.equal(s, scale))
+        torch.testing.assert_close(expected_w, expected_dq, atol=0, rtol=0)
+        torch.testing.assert_close(dq, expected_dq, atol=0, rtol=0)
+
+    def test_plain_fp8_gptq_ignores_static_act_order(self):
+        torch.manual_seed(15)
+        W = torch.randn(3, 16) * 0.1
+        X = torch.randn(20, 16)
+        with patch.dict("os.environ", {"PRISMAQUANT_GPTQ_BLOCK_SIZE": "7"}):
+            q_ref, s_ref, dq_ref = enc._gptq_obs_rounding_fp8_like(
+                W,
+                X,
+                fmt="FP8_E4M3",
+                static_act_order=False,
+            )
+            q, s, dq = enc._gptq_obs_rounding_fp8_like(
+                W,
+                X,
+                fmt="FP8_E4M3",
+                static_act_order=True,
+            )
+        self.assertTrue(torch.equal(q, q_ref))
+        torch.testing.assert_close(s, s_ref, atol=0, rtol=0)
+        torch.testing.assert_close(dq, dq_ref, atol=0, rtol=0)
 
 
 class TestPackBits(unittest.TestCase):
@@ -506,7 +1193,7 @@ class TestRecipeParsing(unittest.TestCase):
         mx8 = {"bits": 8, "data_type": "mx_fp"}
         bf = {"bits": 16, "data_type": "float"}
         self.assertEqual(canonicalize_format(nv), "NVFP4")
-        self.assertEqual(canonicalize_format(mx8), "MXFP8")
+        self.assertEqual(canonicalize_format(mx8), "MXFP8_E4M3")
         self.assertEqual(canonicalize_format(bf), "BF16")
         self.assertEqual(canonicalize_format({"bits": 4, "data_type": "mx_fp"}), "MXFP4")
 
@@ -584,6 +1271,42 @@ class TestBuildQuantizationConfig(unittest.TestCase):
         # NVFP4 group must declare its per-group format so vLLM's
         # is_activation_quantization_format check enables W4A4 dispatch.
         self.assertEqual(nvfp4["format"], "nvfp4-pack-quantized")
+
+    def test_lfm2_experts_use_canonical_vllm_scheme_names(self):
+        # LFM2.5 names experts w1/w3/w2 on disk, but vLLM's FusedMoE scheme
+        # detection (get_moe_method) and ignore matching probe the canonical
+        # gate_proj/up_proj/down_proj. The exported config_groups targets AND
+        # ignore regexes for packed experts must therefore use the canonical
+        # names (weights still ship as w1/w2/w3), or vLLM mis-resolves the
+        # scheme (weight-only NVFP4A16 / BF16 experts left un-ignored) and the
+        # artifact fails to load.
+        from prismaquant.model_profiles.lfm2_moe import Lfm2MoeProfile
+        profile = Lfm2MoeProfile()
+        assignment = {
+            "model.layers.2.feed_forward.experts.gate_up_proj": "NVFP4",
+            "model.layers.2.feed_forward.experts.down_proj": "NVFP4",
+        }
+        qc = build_quantization_config(
+            assignment,
+            bf16_passthrough={
+                "model.layers.3.feed_forward.experts.gate_up_proj",
+                "model.layers.3.feed_forward.experts.down_proj",
+            },
+            profile=profile,
+        )
+        expert_targets = [t for g in qc["config_groups"].values()
+                          for t in g["targets"] if "experts" in t]
+        expert_ignores = [x for x in qc["ignore"]
+                          if "experts" in x and x.startswith("re:")]
+        all_expert = expert_targets + expert_ignores
+        self.assertTrue(all_expert, "expected packed-expert regexes")
+        self.assertTrue(any("gate_proj" in t for t in all_expert),
+                        "no canonical gate_proj target/ignore emitted")
+        # On-disk projection names must NOT leak into vLLM scheme regexes.
+        for t in all_expert:
+            self.assertNotIn("(w1", t, f"on-disk name leaked: {t}")
+            self.assertNotIn("w3|", t, f"on-disk name leaked: {t}")
+            self.assertNotIn("|w2", t, f"on-disk name leaked: {t}")
 
     def test_ignore_uses_vllm_internal_naming(self):
         profile = Qwen3_5Profile()
@@ -735,6 +1458,41 @@ class TestBuildQuantizationConfig(unittest.TestCase):
         self.assertGreater(len(mtp_hits), 0,
                            f"missing MTP-prefixed ignore regex for MTP layer")
 
+    def test_materialized_mtp_packed_parent_filters_source_expert_children(self):
+        """BF16 MTP packed experts are synthesized as vLLM aggregate tensors.
+
+        The source checkpoint stores the same weights as per-expert children.
+        Copying those children as passthrough creates duplicate MTP expert keys
+        and vLLM warns that `layers.0.mlp.experts.N.*.weight` was not found.
+        """
+        profile = Qwen3_5Profile()
+        materialized = {
+            "mtp.layers.0.mlp.experts.gate_up_proj": torch.empty(1),
+            "mtp.layers.0.mlp.experts.down_proj": torch.empty(1),
+        }
+        src_extra = {
+            "mtp.layers.0.mlp.experts.0.gate_proj.weight": torch.empty(1),
+            "mtp.layers.0.mlp.experts.0.up_proj.weight": torch.empty(1),
+            "mtp.layers.0.mlp.experts.0.down_proj.weight": torch.empty(1),
+            "mtp.layers.0.input_layernorm.weight": torch.empty(1),
+            "model.visual.blocks.0.norm.weight": torch.empty(1),
+        }
+
+        filtered = enc._filter_source_passthrough_against_materialized(
+            src_extra,
+            materialized,
+            profile=profile,
+        )
+
+        self.assertNotIn(
+            "mtp.layers.0.mlp.experts.0.gate_proj.weight", filtered)
+        self.assertNotIn(
+            "mtp.layers.0.mlp.experts.0.up_proj.weight", filtered)
+        self.assertNotIn(
+            "mtp.layers.0.mlp.experts.0.down_proj.weight", filtered)
+        self.assertIn("mtp.layers.0.input_layernorm.weight", filtered)
+        self.assertIn("model.visual.blocks.0.norm.weight", filtered)
+
     def test_packed_moe_mixed_format_rejected(self):
         """Different formats on gate_up_proj and down_proj of the same
         FusedMoE is a promote_moe_pair bug — we loud-crash rather than
@@ -837,6 +1595,108 @@ class TestQuantize2DDispatch(unittest.TestCase):
         self.assertEqual(tuple(out["weight_packed"].shape), (8, 16))
         self.assertEqual(out["weight_scale"].dtype, torch.uint8)
         self.assertEqual(tuple(out["weight_scale"].shape), (8, 1))
+
+    def test_mxfp8_export_static_act_order_do_no_harm_selects_lower_candidate(self):
+        import os
+        import prismaquant.export_native_compressed as m
+
+        W = torch.randn(4, 32) * 0.1
+        X = torch.randn(12, 32)
+        calls = []
+
+        def fake_gptq(weight, activations, **kwargs):
+            del activations
+            use_static = bool(kwargs["static_act_order"])
+            calls.append(use_static)
+            marker = 2.0 if use_static else 1.0
+            q = torch.full(
+                tuple(weight.shape),
+                marker,
+                dtype=torch.float32,
+                device=weight.device,
+            ).to(torch.float8_e4m3fn)
+            s = torch.zeros(
+                (weight.shape[0], weight.shape[1] // 32),
+                dtype=torch.uint8,
+                device=weight.device,
+            )
+            dq = weight.to(torch.float32) + (1.0 if use_static else 0.0)
+            return q, s, dq
+
+        saved = m._gptq_obs_rounding_fp8_like
+        saved_sweep = os.environ.get("PRISMAQUANT_GPTQ_DAMP_SWEEP")
+        try:
+            os.environ["PRISMAQUANT_GPTQ_DAMP_SWEEP"] = "0"
+            m._gptq_obs_rounding_fp8_like = fake_gptq
+            out = m._quantize_2d(
+                W,
+                "MXFP8_E4M3",
+                gptq_enabled=True,
+                static_act_order_enabled=True,
+                cached_activations=X,
+            )
+        finally:
+            m._gptq_obs_rounding_fp8_like = saved
+            if saved_sweep is None:
+                os.environ.pop("PRISMAQUANT_GPTQ_DAMP_SWEEP", None)
+            else:
+                os.environ["PRISMAQUANT_GPTQ_DAMP_SWEEP"] = saved_sweep
+
+        self.assertEqual(calls, [False, True])
+        self.assertTrue(torch.equal(
+            out["weight"].float(),
+            torch.ones_like(W),
+        ))
+
+    def test_mxfp8_export_do_no_harm_reverts_bad_gptq_to_rtn(self):
+        import os
+        import prismaquant.export_native_compressed as m
+
+        W = torch.randn(4, 32) * 0.1
+        X = torch.randn(12, 32)
+
+        def fake_gptq(weight, activations, **kwargs):
+            del activations, kwargs
+            q = torch.full(
+                tuple(weight.shape),
+                7.0,
+                dtype=torch.float32,
+                device=weight.device,
+            ).to(torch.float8_e4m3fn)
+            s = torch.zeros(
+                (weight.shape[0], weight.shape[1] // 32),
+                dtype=torch.uint8,
+                device=weight.device,
+            )
+            return q, s, weight.to(torch.float32) + 100.0
+
+        saved = m._gptq_obs_rounding_fp8_like
+        saved_sweep = os.environ.get("PRISMAQUANT_GPTQ_DAMP_SWEEP")
+        saved_dnh = os.environ.get("PRISMAQUANT_DO_NO_HARM")
+        try:
+            os.environ["PRISMAQUANT_GPTQ_DAMP_SWEEP"] = "0"
+            os.environ["PRISMAQUANT_DO_NO_HARM"] = "1"
+            m._gptq_obs_rounding_fp8_like = fake_gptq
+            out = m._quantize_2d(
+                W,
+                "MXFP8_E4M3",
+                gptq_enabled=True,
+                cached_activations=X,
+            )
+        finally:
+            m._gptq_obs_rounding_fp8_like = saved
+            if saved_sweep is None:
+                os.environ.pop("PRISMAQUANT_GPTQ_DAMP_SWEEP", None)
+            else:
+                os.environ["PRISMAQUANT_GPTQ_DAMP_SWEEP"] = saved_sweep
+            if saved_dnh is None:
+                os.environ.pop("PRISMAQUANT_DO_NO_HARM", None)
+            else:
+                os.environ["PRISMAQUANT_DO_NO_HARM"] = saved_dnh
+
+        q_rtn, s_rtn = quantize_dequantize_mxfp8(W)
+        self.assertTrue(torch.equal(out["weight"], q_rtn))
+        self.assertTrue(torch.equal(out["weight_scale"], s_rtn))
 
     def test_mxfp4_packed_expert_shapes(self):
         W = torch.randn(2, 6, 32) * 0.1
@@ -941,6 +1801,54 @@ class TestProductionCacheExportPath(unittest.TestCase):
             out = m._pack_production_cached_2d(
                 "model.layers.0.self_attn.q_proj",
                 "FP8_E4M3",
+                device=torch.device("cpu"),
+            )
+            self.assertIsNone(out)
+        finally:
+            m._PRODUCTION_WEIGHT_CACHE = saved_cache
+            m._CACHED_ACTIVATIONS = saved_acts
+
+    def test_fp8_gptq_cache_defers_to_export_recompute(self):
+        import prismaquant.export_native_compressed as m
+        from prismaquant.production_weight_cache import ProductionWeightCache
+
+        W = torch.randn(8, 32) * 0.1
+        cache = ProductionWeightCache(
+            weights={("model.layers.0.self_attn.q_proj", "FP8_E4M3"): W},
+            levers={"gptq": True},
+        )
+        saved_cache = m._PRODUCTION_WEIGHT_CACHE
+        saved_acts = m._CACHED_ACTIVATIONS
+        try:
+            m._PRODUCTION_WEIGHT_CACHE = cache
+            m._CACHED_ACTIVATIONS = object()
+            out = m._pack_production_cached_2d(
+                "model.layers.0.self_attn.q_proj",
+                "FP8_E4M3",
+                device=torch.device("cpu"),
+            )
+            self.assertIsNone(out)
+        finally:
+            m._PRODUCTION_WEIGHT_CACHE = saved_cache
+            m._CACHED_ACTIVATIONS = saved_acts
+
+    def test_mxfp8_e4m3_gptq_cache_defers_to_export_recompute(self):
+        import prismaquant.export_native_compressed as m
+        from prismaquant.production_weight_cache import ProductionWeightCache
+
+        W = torch.randn(8, 32) * 0.1
+        cache = ProductionWeightCache(
+            weights={("model.layers.0.self_attn.q_proj", "MXFP8_E4M3"): W},
+            levers={"gptq": True, "joint_scale_opt": True},
+        )
+        saved_cache = m._PRODUCTION_WEIGHT_CACHE
+        saved_acts = m._CACHED_ACTIVATIONS
+        try:
+            m._PRODUCTION_WEIGHT_CACHE = cache
+            m._CACHED_ACTIVATIONS = object()
+            out = m._pack_production_cached_2d(
+                "model.layers.0.self_attn.q_proj",
+                "MXFP8_E4M3",
                 device=torch.device("cpu"),
             )
             self.assertIsNone(out)
@@ -1099,6 +2007,15 @@ class TestPackedExpertSplit(unittest.TestCase):
         self.assertEqual(out["weight_packed"].shape[0], E)
         self.assertEqual(out["weight_global_scale"].shape, torch.Size([E]))
 
+    def test_quantize_3d_packed_fp8_returns_per_expert_channel_scales(self):
+        E, M, N = 4, 32, 64
+        P = torch.randn(E, M, N) * 0.05
+        out = _quantize_3d_packed(P, "FP8_E4M3")
+        self.assertEqual(out["weight"].dtype, torch.float8_e4m3fn)
+        self.assertEqual(out["weight"].shape, torch.Size([E, M, N]))
+        self.assertEqual(out["weight_scale"].dtype, torch.float32)
+        self.assertEqual(out["weight_scale"].shape, torch.Size([E, M, 1]))
+
 
 class TestQwen35ProfileFallback(unittest.TestCase):
     def _cpu_only_profile(self):
@@ -1134,6 +2051,18 @@ class TestQwen35ProfileFallback(unittest.TestCase):
                 "model.layers.25.self_attn.q_proj"
             ),
             "model.layers.25.self_attn.qkv_proj",
+        )
+        self.assertEqual(
+            profile.fused_sibling_group(
+                "model.layers.25.mlp.shared_expert.gate_proj"
+            ),
+            "model.layers.25.mlp.shared_expert.gate_up_proj",
+        )
+        self.assertEqual(
+            profile.fused_sibling_group(
+                "model.layers.25.mlp.shared_expert.up_proj"
+            ),
+            "model.layers.25.mlp.shared_expert.gate_up_proj",
         )
 
     def test_promote_fused_keeps_linear_attn_qkvz_coherent_without_vllm(self):
@@ -1217,9 +2146,12 @@ class TestRuntimeLegalAssignment(unittest.TestCase):
             })
 
         self.assertEqual(assignment["model.layers.0.linear_attn.in_proj_a"], "BF16")
-        self.assertEqual(assignment["model.layers.0.self_attn.o_proj"], "MXFP8")
+        self.assertEqual(
+            assignment["model.layers.0.self_attn.o_proj"],
+            "MXFP8_E4M3",
+        )
         self.assertEqual(coerced, [
-            ("model.layers.0.linear_attn.in_proj_a", [48, 5120], "MXFP8")
+            ("model.layers.0.linear_attn.in_proj_a", [48, 5120], "MXFP8_E4M3")
         ])
 
     def test_coerces_profile_illegal_dense_format_to_bf16(self):
@@ -1320,7 +2252,7 @@ class TestRuntimeLegalAssignment(unittest.TestCase):
         reasons = {entry["name"]: entry["reason"] for entry in audit["entries"]}
         self.assertEqual(
             reasons["model.layers.0.linear_attn.in_proj_a"],
-            "runtime_coerced_from_mxfp8",
+            "runtime_coerced_from_mxfp8_e4m3",
         )
         self.assertEqual(
             reasons["model.layers.0.self_attn.o_proj"],

@@ -24,18 +24,23 @@ The math is bitwise-equivalent to the per-Linear functions in
 """
 from __future__ import annotations
 
+import logging
+
 import torch
+
+logger = logging.getLogger(__name__)
 
 # Re-import codebook helpers from the main export module to avoid
 # duplicating the FP4 grid definition.
 from .export_native_compressed import (
     _activation_matrix_for_gptq,
+    _gptq_column_block_size,
     _gptq_obs_rounding_nvfp4,
-    _nvfp4_codebook,
+    _nvfp4_effective_scale_from_real,
+    _nvfp4_quantize_dequantize_with_eff_scale,
     _rtn_dequant_nvfp4,
-    _round_to_codebook,
     _select_nvfp4_group_scales,
-    NVFP4_MAX,
+    FLOAT_TO_E2M1,
     FP8_E4M3_MAX,
 )
 
@@ -112,15 +117,6 @@ def _build_H_stack(
             dead_mask[e] = dead
         H_stack[e] = H
     return H_stack, dead_mask
-
-
-def _batched_round_to_codebook(in_grid: torch.Tensor) -> torch.Tensor:
-    """Round any-rank tensor to NVFP4 codebook indices (same encoding
-    as `_round_to_codebook` in the per-Linear path)."""
-    # The single-Linear `_round_to_codebook` already operates element-
-    # wise on its input — re-using it here is a no-op cost since it is
-    # itself batched over the leading dimensions.
-    return _round_to_codebook(in_grid)
 
 
 def gptq_obs_rounding_nvfp4_batched(
@@ -203,7 +199,6 @@ def gptq_obs_rounding_nvfp4_batched(
         return torch.stack(outputs, dim=0)
 
     device = weights.device
-    cb = _nvfp4_codebook(device, dtype=torch.float32)
     out_buf = torch.empty_like(weights)
 
     for e_start in range(0, E, expert_chunk):
@@ -279,43 +274,47 @@ def gptq_obs_rounding_nvfp4_batched(
             global_real = (
                 s_g_real_full.reshape(Ec, -1).amax(dim=-1) / FP8_E4M3_MAX
             ).clamp_min(1e-12)  # [Ec]
-        global_real_b = global_real.view(Ec, 1, 1)  # [Ec, 1, 1]
+        grouped = W.reshape(Ec, out_features, in_features // group_size, group_size)
+        s_g_real = _select_nvfp4_group_scales(grouped)
+        scale_by_col = _nvfp4_effective_scale_from_real(
+            s_g_real,
+            global_real.view(Ec, 1, 1),
+            quantize_fp8=True,
+        ).repeat_interleave(group_size, dim=2)
 
-        U_diag = torch.diagonal(U, dim1=-2, dim2=-1)  # [Ec, in]
-
-        # 4. Block-by-block column update. Within a block, batch over
-        # the expert dimension so each column update issues one bmm
-        # for all Ec experts instead of Ec separate matmuls.
-        for block_start in range(0, in_features, group_size):
-            block_end = min(block_start + group_size, in_features)
-            block = W[:, :, block_start:block_end]      # [Ec, out, gs]
-
-            # Per-Linear per-row max within the block → scale.
-            s_g_real = _select_nvfp4_group_scales(block).unsqueeze(-1)
-            fp8_scale_real = (s_g_real / global_real_b).clamp(0, FP8_E4M3_MAX)
-            eff_scale = (fp8_scale_real * global_real_b).clamp_min(1e-12)
-            in_grid = (block / eff_scale).clamp(-NVFP4_MAX, NVFP4_MAX)
-            fp4_idx = _batched_round_to_codebook(in_grid)
-            abs_idx = fp4_idx & 0x7
-            sign = -((fp4_idx >> 3).to(torch.float32) * 2 - 1)
-            q_vals = sign * cb[abs_idx]                  # [Ec, out, gs]
-            block_dq = q_vals * eff_scale
-            block_err = block - block_dq                 # [Ec, out, gs]
-
-            # 5. Propagate error to the remaining columns.
+        # 4. FP-Quant/GPTQ column update. Quantizer parameters are fixed
+        # before the solve, then each column's OBS error is propagated
+        # through later columns inside the GPTQ block and later blocks.
+        block_size = _gptq_column_block_size(in_features)
+        for block_start in range(0, in_features, block_size):
+            block_end = min(block_start + block_size, in_features)
+            ncols = block_end - block_start
+            block = W[:, :, block_start:block_end].clone()  # [Ec, out, bs]
+            errs = torch.zeros_like(block)
+            U_block = U[:, block_start:block_end, block_start:block_end]
+            for i in range(ncols):
+                col_idx = block_start + i
+                col = block[:, :, i]  # [Ec, out]
+                eff_scale = scale_by_col[:, :, col_idx].unsqueeze(-1)
+                _idx, col_dq = _nvfp4_quantize_dequantize_with_eff_scale(
+                    col.unsqueeze(-1),
+                    eff_scale,
+                )
+                col_dq = col_dq.squeeze(-1)
+                W[:, :, col_idx] = col_dq
+                denom = U_block[:, i, i].clamp_min(1e-12)
+                err = (col - col_dq) / denom.view(Ec, 1)
+                block[:, :, i:] = (
+                    block[:, :, i:]
+                    - err.unsqueeze(-1) * U_block[:, i, i:].unsqueeze(1)
+                )
+                errs[:, :, i] = err
             if block_end < in_features:
-                U_block_diag = U_diag[:, block_start:block_end].clamp_min(
-                    1e-12)                              # [Ec, gs]
-                U_offdiag = U[:, block_start:block_end, block_end:]
-                # ^ [Ec, gs, rest]
-                # err_scaled = block_err / U_block_diag (broadcast on out dim)
-                err_scaled = block_err / U_block_diag.unsqueeze(1)
-                # Batched matmul across experts: each Ec gets its own
-                # [out, gs] @ [gs, rest] = [out, rest].
-                prop = torch.bmm(err_scaled, U_offdiag)  # [Ec, out, rest]
+                prop = torch.bmm(
+                    errs,
+                    U[:, block_start:block_end, block_end:],
+                )
                 W[:, :, block_end:] = W[:, :, block_end:] - prop
-
-            W[:, :, block_start:block_end] = block_dq
 
         # v26 per-Linear failure handling: any Linear whose Cholesky
         # failed gets the un-error-propagated input weight back. The
@@ -326,6 +325,16 @@ def gptq_obs_rounding_nvfp4_batched(
         # pack will RTN-quantize as if no GPTQ ran.
         if failed_mask.any():
             failed_idx = failed_mask.nonzero(as_tuple=True)[0]
+            # Surface the silent GPTQ->RTN degradation: these experts'
+            # Cholesky was singular/NaN/OOM, so they ship as un-error-
+            # propagated NVFP4 RTN (lower calibration fidelity than GPTQ).
+            logger.warning(
+                "batched GPTQ: %d/%d experts in this chunk fell back to "
+                "RTN (Cholesky failed); they export as un-error-propagated "
+                "NVFP4. Expert indices in chunk: %s",
+                int(failed_mask.sum().item()), int(failed_mask.numel()),
+                failed_idx.tolist(),
+            )
             for j in failed_idx.tolist():
                 override = (
                     global_real[j]
@@ -385,8 +394,6 @@ def scale_sweep_nvfp4_batched(
             f"scale-sweep requires group_size={group_size} ∤ {in_features}")
 
     device = weights.device
-    cb_pos = _nvfp4_codebook(device, dtype=torch.float32)
-    cb = torch.cat([-cb_pos.flip(0), cb_pos[1:]], dim=0)  # [15] signed
     n_g = in_features // group_size
     out_buf = torch.empty_like(weights)
 
@@ -436,12 +443,11 @@ def scale_sweep_nvfp4_batched(
             global_real = (
                 s_g_real.reshape(Ec, -1).amax(dim=-1) / FP8_E4M3_MAX
             ).clamp_min(1e-12)
-        fp8_scale_real = (
-            s_g_real / global_real.view(Ec, 1, 1)
-        ).clamp(0, FP8_E4M3_MAX)
-        eff_scale0 = (
-            fp8_scale_real * global_real.view(Ec, 1, 1)
-        ).unsqueeze(-1).clamp_min(1e-12)  # [Ec, out, n_g, 1]
+        eff_scale0 = _nvfp4_effective_scale_from_real(
+            s_g_real,
+            global_real.view(Ec, 1, 1),
+            quantize_fp8=True,
+        ).unsqueeze(-1)  # [Ec, out, n_g, 1]
 
         init_mse = (col_imp_g * (ref_g - in_g).pow(2)).sum(dim=-1)
         # ^ [Ec, out, n_g]
@@ -451,7 +457,9 @@ def scale_sweep_nvfp4_batched(
 
         # Chunk over the OUT dimension to bound the
         # ``[Ec, out_chunk, n_g, grid, gs, 15]`` intermediate.
-        bytes_per_row = n_g * grid * group_size * cb.numel() * 4
+        bytes_per_row = n_g * grid * group_size * (
+            2 * len(FLOAT_TO_E2M1) - 1
+        ) * 4
         out_chunk = max(
             1, (2 * 1024 * 1024 * 1024) // max(1, Ec * bytes_per_row))
         out_chunk = min(out_features, int(out_chunk))
@@ -469,12 +477,10 @@ def scale_sweep_nvfp4_batched(
             # gexp: [Ec, oc, n_g, 1, gs]; sexp: [Ec, oc, n_g, grid, 1]
             gexp = ref_c.unsqueeze(3)
             sexp = scales_c.unsqueeze(4)
-            v = gexp / sexp  # [Ec, oc, n_g, grid, gs]
-            d = (v.unsqueeze(-1) - cb).abs()  # [Ec, oc, n_g, grid, gs, 15]
-            idx = d.argmin(dim=-1)
-            del d, v
-            Wq_cand = cb[idx] * sexp  # [Ec, oc, n_g, grid, gs]
-            del idx
+            _idx, Wq_cand = _nvfp4_quantize_dequantize_with_eff_scale(
+                gexp,
+                sexp,
+            )  # [Ec, oc, n_g, grid, gs]
             # col_imp_g is [Ec, 1, n_g, gs]; broadcast over (oc, grid).
             # Add a "grid" axis at position 3 → [Ec, 1, n_g, 1, gs] which
             # multiplies cleanly with [Ec, oc, n_g, grid, gs].

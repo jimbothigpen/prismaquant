@@ -54,6 +54,95 @@ class Gemma4Profile(ModelProfile):
     # Overriding to inject `.moe.` ourselves produces a double `.moe.`
     # after vLLM's remap runs — verified experimentally.
 
+    def init_rotaries(self, rotary, cfg, device, dtype) -> bool:
+        """Gemma 4's text rotary is multi-layer-type: it registers one
+        ``<layer_type>_inv_freq`` buffer per entry in ``config.layer_types``,
+        with *mixed* rope types (e.g. ``sliding_attention``=default,
+        ``full_attention``=proportional). The generic single-rope fallback in
+        ``_init_rotary_inplace`` calls ``compute_default_rope_parameters(cfg,
+        device)`` with no ``layer_type`` → ``KeyError: None`` on
+        ``config.rope_parameters[layer_type]`` (issue #6).
+
+        Re-run the rotary's own ``__init__`` on the real device: it rebuilds
+        every ``<layer_type>_inv_freq`` / ``<layer_type>_attention_scaling``
+        with the correct per-type rope init function (proportional / linear /
+        default, plus any per-type kwargs). A hand-rolled
+        ``compute_default_rope_parameters`` loop would silently apply the
+        *default* formula to the proportional layer and produce wrong
+        frequencies."""
+        if getattr(rotary, "layer_types", None) is None:
+            return False
+        if getattr(cfg, "rope_parameters", None) is None:
+            return False
+        try:
+            type(rotary).__init__(rotary, cfg, device=device)
+        except Exception:
+            return False
+        # --- C3 graft (sync 2026-06-12): scaffolding cache-population. ---
+        # This block was formerly the tail of the fork's own init_rotaries
+        # (71faaa8). The fork's redundant hand-rolled per-type inv_freq loop is
+        # dropped — upstream's type(rotary).__init__ above rebuilds every
+        # <layer_type>_inv_freq with the correct per-type rope init function —
+        # but these structural-metadata caches are load-bearing and kept. Every
+        # value derives purely from cfg/text_config (NOT from any local of the
+        # dropped loop), so it is valid on the normal setup path. Populated only
+        # after a successful rotary init (matching the fork's original
+        # caches-iff-success lifecycle). extra_layer_kwargs reads these to supply
+        # per_layer_input and synthesize zero K/V for kv-shared Gemma-4 layers;
+        # if _h_per_layer_input is unset it returns {} for every layer.
+        text_cfg = getattr(cfg, "text_config", None) or cfg
+        h_per = getattr(text_cfg, "hidden_size_per_layer_input", None)
+        Gemma4Profile._h_per_layer_input = int(h_per) if h_per else None
+        n_layers = getattr(text_cfg, "num_hidden_layers", None)
+        Gemma4Profile._num_hidden_layers = int(n_layers) if n_layers else 0
+        Gemma4Profile._head_dim = int(getattr(text_cfg, "head_dim", 0) or 0)
+        Gemma4Profile._global_head_dim = int(getattr(text_cfg, "global_head_dim", 0) or 0)
+        Gemma4Profile._num_kv_heads = int(getattr(text_cfg, "num_key_value_heads", 0) or 0)
+        global_kv = getattr(text_cfg, "num_global_key_value_heads", None)
+        Gemma4Profile._num_global_kv_heads = int(global_kv) if global_kv else Gemma4Profile._num_kv_heads
+        Gemma4Profile._attn_k_eq_v = bool(getattr(text_cfg, "attention_k_eq_v", False))
+        Gemma4Profile._layer_types = list(getattr(text_cfg, "layer_types", []) or [])
+        # Clear the per-layer-inputs cache: it's per-probe-pass and stale state
+        # across init_rotaries calls would silently misroute slices.
+        Gemma4Profile._per_layer_inputs_cache = None
+        Gemma4Profile._per_layer_inputs_cache_key = None
+        return True
+
+    # ------------------------------------------------------------
+    # Cross-layer KV sharing.  Gemma4's last `num_kv_shared_layers`
+    # attention layers have no k/v_proj — they reuse the K/V computed by
+    # the last non-shared layer of their `layer_type`, passed via a
+    # `shared_kv_states` dict the model forward threads through every layer.
+    # ------------------------------------------------------------
+    def new_forward_pass_state(self) -> dict:
+        return {"shared_kv_states": {}}
+
+    def capture_forward_pass_state(self, pass_state: dict):
+        """After phase-1's sequential forward, `shared_kv_states[type]` holds
+        the (full-length) K/V the shared layers reuse. Snapshot to CPU."""
+        skv = (pass_state or {}).get("shared_kv_states") or {}
+        out = {}
+        for lt, kv in skv.items():
+            try:
+                out[lt] = tuple(t.detach().to("cpu") for t in kv)
+            except Exception:
+                pass
+        return out
+
+    def isolated_layer_pass_state(self, captured, layer) -> dict:
+        """For an isolated (phase-3) layer forward: a shared layer needs its
+        type's captured K/V (the attention moves them to the right device
+        itself); a non-shared layer just needs a writable dict to store into.
+        Always returns a `shared_kv_states` dict so the layer never sees
+        `None`."""
+        attn = getattr(layer, "self_attn", None)
+        if getattr(attn, "is_kv_shared_layer", False) and captured:
+            lt = getattr(attn, "layer_type", None)
+            kv = captured.get(lt)
+            if kv is not None:
+                return {"shared_kv_states": {lt: kv}}
+        return {"shared_kv_states": {}}
+
     def export_tensor_name(self, model_qname: str) -> str:
         """Keep body/expert export keys in recipe form.
 
@@ -106,82 +195,6 @@ class Gemma4Profile(ModelProfile):
                 "per_layer_projection_norm.",
             ]
         return []
-
-    def init_rotaries(self, rotary, cfg, device, dtype) -> bool:
-        """Gemma-4 has multi-layer-type rope: cfg.rope_parameters is a
-        dict-of-dicts keyed by layer_type (e.g. full_attention,
-        sliding_attention). Mirrors transformers.Gemma4TextRotaryEmbedding.__init__:
-        registers <layer_type>_inv_freq + <layer_type>_attention_scaling per type,
-        plus <layer_type>_original_inv_freq clones. Also registers a None-keyed
-        alias so callers that bypass the layer's layer_type propagation
-        (e.g. probe paths) don't crash."""
-        import torch as _torch
-        rope_params = getattr(cfg, "rope_parameters", None)
-        if not (isinstance(rope_params, dict) and rope_params
-                and all(isinstance(v, dict) for v in rope_params.values()
-                        if v is not None)):
-            return False
-        try:
-            from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
-        except Exception:
-            return False
-        first = None
-        for layer_type, params in rope_params.items():
-            if params is None:
-                continue
-            rope_type = params.get("rope_type", "default")
-            kwargs = {"device": device, "layer_type": layer_type}
-            if layer_type == "full_attention" and rope_type == "proportional":
-                kwargs["head_dim_key"] = "global_head_dim"
-            if rope_type != "default":
-                fn = ROPE_INIT_FUNCTIONS.get(rope_type)
-                if fn is None:
-                    continue
-                inv_freq, scale = fn(cfg, **kwargs)
-            else:
-                inv_freq, scale = rotary.compute_default_rope_parameters(cfg, **kwargs)
-            inv_freq = inv_freq.to(dtype=_torch.float32, device=device)
-            rotary.register_buffer(f"{layer_type}_inv_freq", inv_freq, persistent=False)
-            rotary.register_buffer(f"{layer_type}_original_inv_freq",
-                                   inv_freq.clone(), persistent=False)
-            setattr(rotary, f"{layer_type}_attention_scaling", scale)
-            if first is None:
-                first = (inv_freq, scale)
-        if first is None:
-            return False
-        rotary.register_buffer("None_inv_freq", first[0], persistent=False)
-        setattr(rotary, "None_attention_scaling", first[1])
-        rotary.register_buffer("inv_freq", first[0], persistent=False)
-        if hasattr(rotary, "original_inv_freq"):
-            rotary.register_buffer("original_inv_freq",
-                                   first[0].clone(), persistent=False)
-        rotary.attention_scaling = first[1]
-        # Cache hidden_size_per_layer_input for extra_layer_kwargs to use later.
-        text_cfg = getattr(cfg, "text_config", None) or cfg
-        h_per = getattr(text_cfg, "hidden_size_per_layer_input", None)
-        Gemma4Profile._h_per_layer_input = int(h_per) if h_per else None
-        # Cache num_hidden_layers + num_kv_shared_layers for shared_kv_states.
-        n_layers = getattr(text_cfg, "num_hidden_layers", None)
-        Gemma4Profile._num_hidden_layers = int(n_layers) if n_layers else 0
-        # === KV zeros synthesis (Gemma-4 kv-shared layers) ===
-        # Cache shape parameters for synthesizing zero K/V tensors that
-        # let kv-shared layers (last num_kv_shared_layers of the model)
-        # unpack shared_kv_states without crashing. Hessian for q_proj on
-        # those layers will be slightly biased (attention output is zero,
-        # so downstream sees no info from these layers) — acceptable.
-        Gemma4Profile._head_dim = int(getattr(text_cfg, "head_dim", 0) or 0)
-        Gemma4Profile._global_head_dim = int(getattr(text_cfg, "global_head_dim", 0) or 0)
-        Gemma4Profile._num_kv_heads = int(getattr(text_cfg, "num_key_value_heads", 0) or 0)
-        global_kv = getattr(text_cfg, "num_global_key_value_heads", None)
-        Gemma4Profile._num_global_kv_heads = int(global_kv) if global_kv else Gemma4Profile._num_kv_heads
-        Gemma4Profile._attn_k_eq_v = bool(getattr(text_cfg, "attention_k_eq_v", False))
-        Gemma4Profile._layer_types = list(getattr(text_cfg, "layer_types", []) or [])
-        # Clear the per-layer-inputs cache: it's per-probe-pass and stale
-        # state across init_rotaries calls would silently misroute slices.
-        Gemma4Profile._per_layer_inputs_cache = None
-        Gemma4Profile._per_layer_inputs_cache_key = None
-
-        return True
 
     @staticmethod
     def _maybe_compute_per_layer_input(base_model, input_ids, layer_idx):

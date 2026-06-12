@@ -17,11 +17,17 @@ quantization path:
     * calibrated `input_global_scale` per fused-sibling group
       (max_abs(activations) / 6.0; the same value the export persists
       to the artifact)
-    * progressive local render gates for FourOverSix, GPTQ,
-      optional scale_sweep, MXFP8 scale-sweep, and FP8 scale-sweep; regressive
-      candidates fall back to the previous accepted render and record metadata
-    * activation-weighted MXFP8 E8M0 scale search and FP8 dynamic per-row
-      scale search when scale_sweep is enabled
+    * progressive local render gates using the shared mechanism order
+      baseline -> format scale rule -> GPTQ -> optional scale_sweep;
+      individual formats explicitly opt out of unsupported mechanisms,
+      and regressive candidates fall back to the previous accepted render
+      while recording metadata
+    * FP8_DYNAMIC/FP8_E4M3 per-row scale search when scale_sweep is enabled;
+      explicit MXFP8 E8M0 scale search remains opt-in. These refine the current
+      accepted render rather than starting a separate format-specific path
+    * activation-weighted GPTQ for FP8_DYNAMIC/FP8_E4M3. Explicit MXFP8 keeps
+      GPTQ support for research/legacy artifacts. NVFP4 is the only production
+      format that uses joint_scale_opt; MXFP8 uses the canonical E8M0 scale rule.
     * retired Fisher-weighted local objectives are archived under
       ``archive/fisher_2026-05-15/`` and are not part of the production
       pipeline
@@ -35,8 +41,11 @@ quantization path:
     * block-output match (post-GPTQ refinement against BF16 block output)
     * any export-only refinements added after this docstring is written
 
-  MXFP8/FP8/BF16:
-    * MXFP8 and FP8 use the same scale paths as export under scale_sweep.
+  FP8_DYNAMIC / BF16:
+    * FP8_DYNAMIC is represented by the canonical FP8_E4M3 format name:
+      per-output-row FP32 weight scales and per-token dynamic activation
+      scales. It uses GPTQ damp-sweep by default in production render.
+    * Explicit MXFP8/MXFP4 formats remain available only when requested.
     * BF16 is passthrough.
 
 PerturbedActivationCache installs `W_tilde` (and applies the calibrated
@@ -71,6 +80,7 @@ from prismaquant.activation_sampling import update_priority_reservoir
 from prismaquant.build_rtn_cache import iter_quantizable_tensors
 from prismaquant.render_score import (
     gate_render_candidate,
+    normalize_row_weights,
     resolve_render_mechanism_order,
     score_render_error,
 )
@@ -84,6 +94,23 @@ def _render_base_format(fmt: str) -> str:
 def _cache_weight_filename(qname: str, fmt: str) -> str:
     safe = qname.replace("/", "__").replace(".", "_")
     return f"{safe}__{fmt}.pt"
+
+
+_UNCACHED_PACKED_EXPERT_RE = re.compile(
+    r"\.experts(?:\.\d+)?\."
+    r"(?:gate_up_proj|down_proj|gate_proj|up_proj|w1|w2|w3)$"
+)
+
+
+def is_uncached_packed_expert_qname(qname: str) -> bool:
+    """Return True for packed-MoE expert tensors not rendered by this cache.
+
+    ``ProductionWeightCache`` currently renders production-faithful 2D
+    ``nn.Linear`` weights. Packed 3D MoE expert tensors are quantized by the
+    packed exporter/validation fallback path, so missing cache entries for
+    those names must not fail production-cache residency checks.
+    """
+    return bool(_UNCACHED_PACKED_EXPERT_RE.search(str(qname)))
 
 
 @dataclass
@@ -265,6 +292,8 @@ class ProductionWeightCache:
                 continue
             key = self.resolve_key(str(qname), fmt_canon)
             if key is None:
+                if is_uncached_packed_expert_qname(str(qname)):
+                    continue
                 missing.append((str(qname), fmt_canon))
                 continue
             if key not in seen:
@@ -966,7 +995,9 @@ def _store_rendered_weight_entry(
     tensor: torch.Tensor,
     weight_dtype: torch.dtype,
 ) -> None:
-    fmt = fmt.upper()
+    from prismaquant import format_registry as fr
+
+    fmt = fr.canonical_format_name(str(fmt).strip().upper())
     target_dtype = weight_dtype if weight_dtype != torch.float32 else torch.bfloat16
     stored = tensor.to(target_dtype).cpu()
     if cache_dir_path is not None:
@@ -995,8 +1026,6 @@ def _render_score_for_gate(
     reference_weight: torch.Tensor,
     rendered_weight: torch.Tensor,
     activations: torch.Tensor | None,
-    *,
-    row_weights: torch.Tensor | None,
 ) -> tuple[float, str]:
     """Score a local render candidate with the shared scorer.
 
@@ -1009,15 +1038,14 @@ def _render_score_for_gate(
         and activations.numel() > 0
         and int(activations.shape[-1]) == int(reference_weight.shape[1])
     ):
-        metric = "fisher_output_mse" if row_weights is not None else "output_mse"
         return (
             score_render_error(
                 reference_weight,
                 rendered_weight,
                 activations,
-                row_weights=row_weights,
+                row_weights=None,
             ),
-            metric,
+            "output_mse",
         )
     diff = (
         reference_weight.detach().to(torch.float32)
@@ -1027,6 +1055,245 @@ def _render_score_for_gate(
         )
     )
     return float(diff.pow(2).mean().item()), "weight_mse"
+
+
+def _render_score_record_key(qname: str, fmt: str) -> str:
+    return f"{qname}|{fmt.upper()}"
+
+
+def _render_score_normalizer(
+    reference_weight: torch.Tensor,
+    activations: torch.Tensor | None,
+    metric: str,
+) -> tuple[float, int]:
+    rows, cols = reference_weight.shape
+    if (
+        metric in {"output_mse", "fisher_output_mse"}
+        and activations is not None
+        and activations.numel() > 0
+        and int(activations.shape[-1]) == int(cols)
+    ):
+        n_act_rows = int(activations.reshape(-1, cols).shape[0])
+        return float(max(1, n_act_rows) * int(rows)), n_act_rows
+    return float(max(1, int(rows) * int(cols))), 0
+
+
+def _render_score_record(
+    *,
+    qname: str,
+    fmt: str,
+    render_format: str,
+    reference_weight: torch.Tensor,
+    rendered_weight: torch.Tensor,
+    activations: torch.Tensor | None,
+    activation_max_abs: float | None,
+) -> dict[str, object]:
+    raw_score, raw_metric = _render_score_for_gate(
+        reference_weight.detach().to(torch.float32),
+        rendered_weight,
+        activations,
+    )
+    score = raw_score
+    metric = raw_metric
+    activation_quantized = False
+    activation_clipped = False
+    activation_clip_max = (
+        activation_max_abs
+        if _format_uses_static_activation_clip(fmt) else
+        None
+    )
+    if (
+        activations is not None
+        and activations.numel() > 0
+        and int(activations.shape[-1]) == int(reference_weight.shape[1])
+    ):
+        try:
+            from prismaquant import format_registry as fr
+
+            spec = fr.get_format(fr.canonical_format_name(fmt))
+            score, metric, activation_quantized, activation_clipped = (
+                _local_forward_render_score(
+                    reference_weight=reference_weight,
+                    rendered_weight=rendered_weight,
+                    activations=activations,
+                    activation_quantize=spec.activation_quantize_dequantize,
+                    activation_max_abs=activation_clip_max,
+                )
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"activation-aware render scoring failed for {qname} @ {fmt}: "
+                f"{exc}"
+            ) from exc
+    normalizer, activation_rows = _render_score_normalizer(
+        reference_weight,
+        activations,
+        metric,
+    )
+    # weight_mse is the original prismaquant cost surrogate: pure
+    # (W_orig - W_rendered)^2 averaged over weights. Activation-independent,
+    # low variance; the allocator multiplies by h_trace for predicted_dloss.
+    ref_f = reference_weight.detach().to(
+        device=rendered_weight.device, dtype=torch.float32,
+    )
+    rendered_f = rendered_weight.detach().to(torch.float32)
+    diff = ref_f - rendered_f
+    n_weights = int(diff.numel())
+    weight_mse = float(diff.pow(2).mean().item()) if n_weights > 0 else 0.0
+    rows, cols = reference_weight.shape
+    return {
+        "qname": str(qname),
+        "format": str(fmt).upper(),
+        "render_format": str(render_format).upper(),
+        "metric": str(metric),
+        "score": float(score),
+        "score_sum": float(score) * float(normalizer),
+        "raw_render_metric": str(raw_metric),
+        "raw_render_score": float(raw_score),
+        "raw_render_score_sum": float(raw_score) * float(normalizer),
+        "weight_mse": float(weight_mse),
+        "weight_mse_sum": float(weight_mse) * float(n_weights),
+        "n_weights": int(n_weights),
+        "normalizer": float(normalizer),
+        "activation_rows": int(activation_rows),
+        "activation_quantized": bool(activation_quantized),
+        "activation_clipped": bool(activation_clipped),
+        "activation_max_abs": (
+            float(activation_clip_max)
+            if activation_clip_max is not None and activation_clip_max > 0
+            else None
+        ),
+        "out_features": int(rows),
+        "in_features": int(cols),
+    }
+
+
+def _format_uses_static_activation_clip(fmt: str) -> bool:
+    """Return whether local scoring should apply a calibrated activation max.
+
+    NVFP4 serving uses a calibrated tensor-level activation scale plus local
+    tensor-group quantization. MXFP8/FP8 dynamic serving computes activation
+    scales at runtime, so applying the NVFP4 activation max to those formats
+    prices the wrong kernel contract.
+    """
+    from prismaquant import format_registry as fr
+
+    return fr.canonical_format_name(str(fmt).strip().upper()) == "NVFP4"
+
+
+def _local_forward_render_score(
+    *,
+    reference_weight: torch.Tensor,
+    rendered_weight: torch.Tensor,
+    activations: torch.Tensor,
+    activation_quantize,
+    activation_max_abs: float | None,
+    row_chunk: int = 128,
+) -> tuple[float, str, bool, bool]:
+    rows, cols = reference_weight.shape
+    if rendered_weight.shape != reference_weight.shape:
+        return float("inf"), "output_mse", False, False
+    if activations.shape[-1] != cols:
+        return float("inf"), "output_mse", False, False
+    device = reference_weight.device
+    ref_t = reference_weight.detach().to(device=device, dtype=torch.float32).t()
+    rendered_t = rendered_weight.detach().to(device=device, dtype=torch.float32).t()
+    x = activations.detach().to(device=device, dtype=torch.float32).reshape(-1, cols)
+    clipped = False
+    if (
+        activation_max_abs is not None
+        and float(activation_max_abs) > 0
+        and _env_flag("PRISMAQUANT_PROD_ACT_SCALES", True)
+    ):
+        x_quant_input = x.clamp(-float(activation_max_abs), float(activation_max_abs))
+        clipped = True
+    else:
+        x_quant_input = x
+
+    total = torch.zeros((), dtype=torch.float32, device=device)
+    quantized_any = False
+    with torch.no_grad():
+        for start in range(0, x.shape[0], int(row_chunk)):
+            x_ref = x[start:start + int(row_chunk)]
+            x_q = activation_quantize(x_quant_input[start:start + int(row_chunk)])
+            if x_q is not x_ref:
+                quantized_any = quantized_any or not torch.equal(
+                    x_q.detach().to(device=device, dtype=torch.float32),
+                    x_ref,
+                )
+            x_q = x_q.to(device=device, dtype=torch.float32)
+            y_ref = x_ref @ ref_t
+            y_q = x_q @ rendered_t
+            err = (y_ref - y_q).pow(2)
+            total = total + err.sum()
+    score = float(total.item()) / max(1, int(x.shape[0]) * int(rows))
+    return score, "output_mse", bool(quantized_any), bool(clipped)
+
+
+def _load_render_score_sidecar(path: Path | None) -> dict[str, dict[str, object]]:
+    if path is None or not path.is_file():
+        return {}
+    import json as _json
+
+    try:
+        raw = _json.loads(path.read_text())
+    except Exception:
+        return {}
+    records = raw.get("records") if isinstance(raw, Mapping) else None
+    if not isinstance(records, Mapping):
+        return {}
+    out: dict[str, dict[str, object]] = {}
+    for key, value in records.items():
+        if isinstance(value, Mapping):
+            out[str(key)] = dict(value)
+    return out
+
+
+def _write_render_score_sidecar(
+    path: Path | None,
+    records: Mapping[str, Mapping[str, object]],
+) -> None:
+    if path is None:
+        return
+    import json as _json
+
+    payload = {
+        "schema": "prismaquant.production_render_scores.v1",
+        "records": dict(sorted((str(k), dict(v)) for k, v in records.items())),
+    }
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(_json.dumps(payload, indent=2, sort_keys=True))
+    os.replace(tmp, path)
+
+
+def _format_supports_render_mechanism(fmt: str, mechanism: str) -> bool:
+    """Return whether a shared render mechanism is meaningful for ``fmt``.
+
+    The production render pipeline is format-agnostic in order. Individual
+    formats opt out of mechanisms whose math or exported schema does not
+    apply.
+    """
+
+    fmt_u = str(fmt).strip().upper()
+    mech = str(mechanism).strip()
+    if fmt_u == "NVFP4":
+        return mech in {
+            "four_over_six",
+            "gptq",
+            "static_act_order",
+            "joint_scale_opt",
+            "fisher_gptq",
+            "scale_sweep",
+        }
+    if fmt_u in {"FP8_E4M3", "FP8_E5M2"}:
+        return mech == "gptq" or (mech == "scale_sweep" and fmt_u == "FP8_E4M3")
+    if fmt_u == "MXFP4":
+        return mech in {"gptq", "static_act_order"}
+    if fmt_u in {"MXFP8_E4M3", "MXFP8_E5M2"}:
+        return mech in {"gptq", "static_act_order"} or (
+            mech == "scale_sweep" and fmt_u == "MXFP8_E4M3"
+        )
+    return False
 
 
 def _render_nvfp4_progressive_candidate(
@@ -1180,7 +1447,6 @@ def _render_nvfp4_progressively(
             reference,
             rendered,
             acts,
-            row_weights=fisher_row_weights,
         )
         return _RenderedCandidate(
             label=label,
@@ -1451,7 +1717,9 @@ def render_production_weight(
     by per-token gradient² from h-detail.
 
     """
-    fmt = fmt.upper()
+    from prismaquant import format_registry as fr
+
+    fmt = fr.canonical_format_name(str(fmt).strip().upper())
     clip_rescale = "none"
     if str(act_clip_rescale or "none").strip().lower() not in {
         "",
@@ -1477,143 +1745,249 @@ def render_production_weight(
         )
 
     if fmt != "NVFP4":
-        from prismaquant import format_registry as fr
         spec = fr.get_format(fmt)
         baseline = spec.quantize_dequantize(weight.detach().clone()).to(
             device=weight.device, dtype=weight.dtype,
         )
-        if (
-            fmt in {"MXFP8", "MXFP8_E4M3"}
-            and bool(levers.get("scale_sweep", False))
-            and qname in activations
-        ):
-            from prismaquant.export_native_compressed import (
-                _mxfp8_scale_sweep_quantize,
+        reference = weight.detach().to(torch.float32)
+        acts = activations.get(qname)
+        acts_for_render = (
+            acts.detach().to(device=weight.device, dtype=torch.float32)
+            if acts is not None and int(acts.shape[-1]) == int(weight.shape[1])
+            else None
+        )
+        baseline_score, baseline_metric = _render_score_for_gate(
+            reference,
+            baseline,
+            acts,
+        )
+        current = _RenderedCandidate(
+            label=f"{fmt.lower()}+rtn",
+            weight=baseline.contiguous(),
+            score=float(baseline_score),
+            metric=baseline_metric,
+            scale_rule="",
+            package=(),
+            has_gptq=False,
+        )
+        if gate_trace is not None:
+            gate_trace.append({
+                "mechanism": "baseline",
+                "selected": current.label,
+                "score": float(current.score),
+                "metric": current.metric,
+                "package": [],
+            })
+
+        def _apply_non_nv_gate(
+            *,
+            mechanism: str,
+            candidates: Sequence[_RenderedCandidate],
+        ) -> None:
+            nonlocal current
+            if not candidates:
+                return
+            best = min(candidates, key=lambda item: item.score)
+            decision = gate_render_candidate(
+                baseline_score=current.score,
+                candidate_score=best.score,
+                metric=best.metric,
+                min_relative_gain=_env_float(
+                    "PRISMAQUANT_RENDER_GATE_MIN_GAIN",
+                    0.0,
+                    lo=-1.0,
+                    hi=1.0,
+                ),
+            )
+            if gate_trace is not None:
+                gate_trace.append({
+                    "mechanism": mechanism,
+                    "accepted": bool(decision.accepted),
+                    "selected": (
+                        best.label if decision.accepted else current.label
+                    ),
+                    "candidate": best.label,
+                    "baseline_score": float(current.score),
+                    "candidate_score": float(best.score),
+                    "relative_gain": float(decision.relative_gain),
+                    "metric": best.metric,
+                    "reason": str(decision.reason),
+                    "package": list(best.package),
+                    "candidates": [
+                        {
+                            "label": cand.label,
+                            "score": float(cand.score),
+                            "metric": cand.metric,
+                            "package": list(cand.package),
+                        }
+                        for cand in candidates
+                    ],
+                })
+            if decision.accepted:
+                old = current.weight
+                current = best
+                if old is not best.weight:
+                    del old
+            for cand in candidates:
+                if cand is not current and cand.weight is not current.weight:
+                    del cand.weight
+
+        def _non_nv_candidate(
+            *,
+            label: str,
+            weight_dq: torch.Tensor,
+            package: tuple[str, ...],
+            has_gptq: bool,
+        ) -> _RenderedCandidate:
+            rendered = weight_dq.to(device=weight.device, dtype=weight.dtype).contiguous()
+            score, metric = _render_score_for_gate(reference, rendered, acts)
+            return _RenderedCandidate(
+                label=label,
+                weight=rendered,
+                score=float(score),
+                metric=metric,
+                scale_rule="",
+                package=package,
+                has_gptq=bool(has_gptq),
             )
 
-            _, _, w_dq = _mxfp8_scale_sweep_quantize(
-                weight.detach().to(torch.float32),
-                activations[qname],
-                group_size=32,
-                clip_threshold=act_clip_threshold,
-                clip_rescale=clip_rescale,
-                fisher_row_weights=fisher_row_weights,
-            )
-            candidate = w_dq.to(device=weight.device, dtype=weight.dtype).contiguous()
-            if progressive_gates:
-                baseline_score, metric = _render_score_for_gate(
-                    weight.detach().to(torch.float32),
-                    baseline,
-                    activations.get(qname),
-                    row_weights=fisher_row_weights,
-                )
-                candidate_score, _ = _render_score_for_gate(
-                    weight.detach().to(torch.float32),
-                    candidate,
-                    activations.get(qname),
-                    row_weights=fisher_row_weights,
-                )
-                decision = gate_render_candidate(
-                    baseline_score=baseline_score,
-                    candidate_score=candidate_score,
-                    metric=metric,
-                    min_relative_gain=_env_float(
-                        "PRISMAQUANT_RENDER_GATE_MIN_GAIN",
-                        0.0,
-                        lo=-1.0,
-                        hi=1.0,
-                    ),
-                )
-                if gate_trace is not None:
-                    gate_trace.append({
-                        "mechanism": "baseline",
-                        "selected": fmt,
-                        "score": float(baseline_score),
-                        "metric": metric,
-                        "package": [],
-                    })
-                    gate_trace.append({
-                        "mechanism": "scale_sweep",
-                        "accepted": bool(decision.accepted),
-                        "selected": "mxfp8_scale_sweep" if decision.accepted else fmt,
-                        "candidate": "mxfp8_scale_sweep",
-                        "baseline_score": float(baseline_score),
-                        "candidate_score": float(candidate_score),
-                        "relative_gain": float(decision.relative_gain),
-                        "metric": metric,
-                        "reason": str(decision.reason),
-                        "package": ["scale_sweep"],
-                    })
-                if decision.accepted:
-                    return candidate
-                return baseline.contiguous()
-            return candidate
         if (
-            fmt == "FP8_E4M3"
-            and bool(levers.get("scale_sweep", False))
-            and qname in activations
+            _format_supports_render_mechanism(fmt, "gptq")
+            and bool(levers.get("gptq", True))
+            and acts_for_render is not None
         ):
-            from prismaquant.export_native_compressed import (
-                _fp8_dynamic_scale_sweep_quantize,
+            from prismaquant import export_native_compressed as enc
+
+            joint_scale_opt = bool(
+                levers.get("joint_scale_opt", False)
+                and _format_supports_render_mechanism(fmt, "joint_scale_opt")
+            )
+            static_act_order = bool(
+                levers.get("static_act_order", False)
+                and _format_supports_render_mechanism(fmt, "static_act_order")
+            )
+            base_package = (
+                ("joint_scale_opt", "gptq")
+                if joint_scale_opt else
+                ("gptq",)
+            )
+            use_damp_sweep = (
+                os.environ.get("PRISMAQUANT_GPTQ_DAMP_SWEEP", "1") != "0"
             )
 
-            _, _, w_dq = _fp8_dynamic_scale_sweep_quantize(
-                weight.detach().to(torch.float32),
-                activations[qname],
-                clip_threshold=act_clip_threshold,
-                clip_rescale=clip_rescale,
-                fisher_row_weights=fisher_row_weights,
-            )
-            candidate = w_dq.to(device=weight.device, dtype=weight.dtype).contiguous()
-            if progressive_gates:
-                baseline_score, metric = _render_score_for_gate(
-                    weight.detach().to(torch.float32),
-                    baseline,
-                    activations.get(qname),
-                    row_weights=fisher_row_weights,
-                )
-                candidate_score, _ = _render_score_for_gate(
-                    weight.detach().to(torch.float32),
-                    candidate,
-                    activations.get(qname),
-                    row_weights=fisher_row_weights,
-                )
-                decision = gate_render_candidate(
-                    baseline_score=baseline_score,
-                    candidate_score=candidate_score,
-                    metric=metric,
-                    min_relative_gain=_env_float(
-                        "PRISMAQUANT_RENDER_GATE_MIN_GAIN",
-                        0.0,
-                        lo=-1.0,
-                        hi=1.0,
+            def _gptq_candidate(use_static_act_order: bool) -> _RenderedCandidate:
+                package = tuple(dict.fromkeys((
+                    *(
+                        ("static_act_order",)
+                        if use_static_act_order else
+                        ()
                     ),
+                    *base_package,
+                )))
+                if fmt == "MXFP4":
+                    if use_damp_sweep:
+                        _q, _s, candidate = enc._gptq_obs_rounding_mxfp4_swept(
+                            reference,
+                            acts_for_render,
+                            group_size=32,
+                            clip_threshold=act_clip_threshold,
+                            clip_rescale=clip_rescale,
+                            fisher_row_weights=fisher_row_weights,
+                            static_act_order=use_static_act_order,
+                        )
+                    else:
+                        _q, _s, candidate = enc._gptq_obs_rounding_mxfp4(
+                            reference,
+                            acts_for_render,
+                            group_size=32,
+                            clip_threshold=act_clip_threshold,
+                            clip_rescale=clip_rescale,
+                            fisher_row_weights=fisher_row_weights,
+                            static_act_order=use_static_act_order,
+                        )
+                elif use_damp_sweep:
+                    _q, _s, candidate = enc._gptq_obs_rounding_fp8_like_swept(
+                        reference,
+                        acts_for_render,
+                        fmt=fmt,
+                        group_size=32,
+                        clip_threshold=act_clip_threshold,
+                        clip_rescale=clip_rescale,
+                        fisher_row_weights=fisher_row_weights,
+                        joint_scale_opt=joint_scale_opt,
+                        static_act_order=use_static_act_order,
+                    )
+                else:
+                    _q, _s, candidate = enc._gptq_obs_rounding_fp8_like(
+                        reference,
+                        acts_for_render,
+                        fmt=fmt,
+                        group_size=32,
+                        clip_threshold=act_clip_threshold,
+                        clip_rescale=clip_rescale,
+                        fisher_row_weights=fisher_row_weights,
+                        joint_scale_opt=joint_scale_opt,
+                        static_act_order=use_static_act_order,
+                    )
+                return _non_nv_candidate(
+                    label=f"{fmt.lower()}+{'+'.join(package)}",
+                    weight_dq=candidate,
+                    package=package,
+                    has_gptq=True,
                 )
-                if gate_trace is not None:
-                    gate_trace.append({
-                        "mechanism": "baseline",
-                        "selected": fmt,
-                        "score": float(baseline_score),
-                        "metric": metric,
-                        "package": [],
-                    })
-                    gate_trace.append({
-                        "mechanism": "scale_sweep",
-                        "accepted": bool(decision.accepted),
-                        "selected": "fp8_scale_sweep" if decision.accepted else fmt,
-                        "candidate": "fp8_scale_sweep",
-                        "baseline_score": float(baseline_score),
-                        "candidate_score": float(candidate_score),
-                        "relative_gain": float(decision.relative_gain),
-                        "metric": metric,
-                        "reason": str(decision.reason),
-                        "package": ["scale_sweep"],
-                    })
-                if decision.accepted:
-                    return candidate
-                return baseline.contiguous()
-            return candidate
-        return baseline.contiguous()
+
+            gptq_candidates = [_gptq_candidate(False)]
+            if static_act_order:
+                gptq_candidates.append(_gptq_candidate(True))
+            _apply_non_nv_gate(
+                mechanism="gptq",
+                candidates=gptq_candidates,
+            )
+
+        if (
+            _format_supports_render_mechanism(fmt, "scale_sweep")
+            and bool(levers.get("scale_sweep", False))
+            and acts_for_render is not None
+        ):
+            if fmt == "MXFP8_E4M3":
+                from prismaquant.export_native_compressed import (
+                    _mxfp8_scale_sweep_quantize,
+                )
+
+                _, _, w_dq = _mxfp8_scale_sweep_quantize(
+                    current.weight.detach().to(torch.float32),
+                    acts_for_render,
+                    group_size=32,
+                    clip_threshold=act_clip_threshold,
+                    clip_rescale=clip_rescale,
+                    fisher_row_weights=fisher_row_weights,
+                )
+            else:
+                from prismaquant.export_native_compressed import (
+                    _fp8_dynamic_scale_sweep_quantize,
+                )
+
+                _, _, w_dq = _fp8_dynamic_scale_sweep_quantize(
+                    current.weight.detach().to(torch.float32),
+                    acts_for_render,
+                    clip_threshold=act_clip_threshold,
+                    clip_rescale=clip_rescale,
+                    fisher_row_weights=fisher_row_weights,
+                )
+            candidate = _non_nv_candidate(
+                label=f"{current.label}+scale_sweep",
+                weight_dq=w_dq,
+                package=tuple(dict.fromkeys((*current.package, "scale_sweep"))),
+                has_gptq=current.has_gptq,
+            )
+            if progressive_gates:
+                _apply_non_nv_gate(
+                    mechanism="scale_sweep",
+                    candidates=[candidate],
+                )
+                return current.weight.contiguous()
+            return candidate.weight.contiguous()
+        return current.weight.contiguous()
 
     from prismaquant.export_native_compressed import _quantize_2d
 
@@ -1822,6 +2196,19 @@ def fill_production_weight_cache(
     if cache_dir is not None:
         cache_dir_path = Path(cache_dir)
         cache_dir_path.mkdir(parents=True, exist_ok=True)
+    render_score_sidecar_path: Path | None = (
+        cache_dir_path / "render_scores.json"
+        if cache_dir_path is not None else None
+    )
+    render_score_records: dict[str, dict[str, object]] = (
+        _load_render_score_sidecar(render_score_sidecar_path)
+    )
+    if progress and render_score_records:
+        print(
+            f"[prod-cache] resume: loaded {len(render_score_records)} "
+            "render-score entries from sidecar",
+            flush=True,
+        )
 
     fmt_set = {
         fmt
@@ -1829,9 +2216,12 @@ def fill_production_weight_cache(
         for fmt in fmts
     }
     render_base_fmt_set = {_render_base_format(fmt) for fmt in fmt_set}
-    activation_aware_formats = {"NVFP4"}
-    if bool(levers.get("scale_sweep", False)):
-        activation_aware_formats.update({"MXFP8", "MXFP8_E4M3", "FP8_E4M3"})
+    # Store activations for every missing rendered format.  NVFP4 needs them
+    # for GPTQ/JSO; FP8_DYNAMIC/FP8_E4M3 and explicit MX formats need them
+    # for their activation-aware renders, and the production-render allocator
+    # cost always needs them to score the final local forward error after the
+    # format's activation quantizer.
+    activation_aware_formats = set(fmt_set)
     qnames_to_render: set[str] = set(qname_set)
     missing_formats_by_qname: dict[str, set[str]] = {
         q: set(render_formats_by_qname.get(q, ())) for q in qname_set
@@ -1854,10 +2244,19 @@ def fill_production_weight_cache(
                 f"({len(qnames_to_render)} still need rendering)",
                 flush=True,
             )
-    qnames_needing_activation = {
-        q for q, missing in missing_formats_by_qname.items()
-        if any(f in activation_aware_formats for f in missing)
-    }
+    qnames_needing_activation = set()
+    for q, missing in missing_formats_by_qname.items():
+        requested = tuple(render_formats_by_qname.get(q, ()))
+        missing_activation_render = any(
+            f in activation_aware_formats for f in missing
+        )
+        missing_activation_score = any(
+            f in activation_aware_formats
+            and _render_score_record_key(q, f) not in render_score_records
+            for f in requested
+        )
+        if missing_activation_render or missing_activation_score:
+            qnames_needing_activation.add(q)
     device = next(model.parameters()).device
     activation_store_device = (
         device if device.type == "cuda" else torch.device("cpu")
@@ -2118,6 +2517,12 @@ def fill_production_weight_cache(
         weight = mod.weight.data
         joint = joint_globals.get(qname)
         max_abs = activation_max_abs.get(qname)
+        row_weights = (
+            fisher_rows.get(qname)
+            if bool(levers.get("fisher_gptq", False))
+            and fisher_rows is not None
+            else None
+        )
         # _quantize_2d's input_global_scale_override expects the export
         # convention (6.0 / max_abs).  It only affects emitted metadata
         # in compute_only mode (not the dequantized weight values), but
@@ -2141,9 +2546,30 @@ def fill_production_weight_cache(
             # from the surviving .pt files.
             if cache_dir_path is not None:
                 fname = _cache_weight_filename(qname, fmt_key)
-                if (cache_dir_path / fname).is_file():
+                disk_path = cache_dir_path / fname
+                if disk_path.is_file():
                     weights[(qname, fmt_key)] = fname
                     skipped_resumed += 1
+                    score_key = _render_score_record_key(qname, fmt_key)
+                    if score_key not in render_score_records:
+                        try:
+                            cached = torch.load(
+                                disk_path,
+                                map_location=weight.device,
+                                weights_only=True,
+                            ).to(device=weight.device, dtype=weight.dtype)
+                            render_score_records[score_key] = _render_score_record(
+                                qname=qname,
+                                fmt=fmt_key,
+                                render_format=render_fmt,
+                                reference_weight=weight,
+                                rendered_weight=cached,
+                                activations=activations_local.get(qname),
+                                activation_max_abs=max_abs,
+                            )
+                            del cached
+                        except Exception:
+                            pass
                     # Do NOT pop activations_local[qname] here: this
                     # loop iterates through every format for this
                     # Linear, and a later format in the same outer
@@ -2160,13 +2586,19 @@ def fill_production_weight_cache(
                     levers=levers,
                     joint_global_real=joint,
                     input_global_scale=export_scale,
-                    fisher_row_weights=(
-                        fisher_rows.get(qname)
-                        if bool(levers.get("fisher_gptq", False))
-                        and fisher_rows is not None
-                        else None
-                    ),
+                    fisher_row_weights=row_weights,
                     gate_trace=gate_trace,
+                )
+                render_score_records[_render_score_record_key(qname, fmt_key)] = (
+                    _render_score_record(
+                        qname=qname,
+                        fmt=fmt_key,
+                        render_format=render_fmt,
+                        reference_weight=weight,
+                        rendered_weight=w_dq,
+                        activations=activations_local.get(qname),
+                        activation_max_abs=max_abs,
+                    )
                 )
                 if gate_trace:
                     render_gate_records.append({
@@ -2200,6 +2632,10 @@ def fill_production_weight_cache(
             del w_dq
             if progress and done % 25 == 0:
                 print(f"[prod-cache] {done}/{n}", flush=True)
+                _write_render_score_sidecar(
+                    render_score_sidecar_path,
+                    render_score_records,
+                )
         # Free this Linear's activation tensor — won't render this qname
         # again, and the activation can be tens of MB on big models.
         activations_local.pop(qname, None)
@@ -2219,6 +2655,7 @@ def fill_production_weight_cache(
             f"{len(failed)} failures",
             flush=True,
         )
+    _write_render_score_sidecar(render_score_sidecar_path, render_score_records)
     render_gate_summary = _summarize_render_gate_records(render_gate_records)
     cache = ProductionWeightCache(
         weights=weights,
@@ -2243,6 +2680,20 @@ def fill_production_weight_cache(
             "render_gates": {
                 **render_gate_summary,
                 "records": render_gate_records,
+            },
+            "render_scores": {
+                "schema": "prismaquant.production_render_scores.v1",
+                "entries": int(len(render_score_records)),
+                "records": dict(sorted(render_score_records.items())),
+                "cost_semantics": (
+                    "score is the rendered candidate's local forward-error "
+                    "mean after the format activation quantizer; score_sum "
+                    "is score multiplied by activation_rows * out_features "
+                    "for output metrics, or by parameter count for weight_mse "
+                    "fallback. raw_render_score records the post-render "
+                    "weight-only reconstruction objective used by local "
+                    "render gates."
+                ),
             },
             "four_over_six": (
                 render_gate_summary.get("mechanisms", {}).get("four_over_six", {

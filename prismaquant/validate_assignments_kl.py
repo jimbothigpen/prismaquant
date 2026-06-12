@@ -94,8 +94,6 @@ def _profile_excludes_bpp_name(name: str, fmt: str, profile) -> bool:
     is_pinned = getattr(profile, "is_pinned_name", None)
     if callable(is_pinned) and bool(is_pinned(name)):
         return True
-    if fr.canonical_format_name(fmt) != "BF16":
-        return False
     passthrough_prefixes = getattr(profile, "source_passthrough_prefixes", None)
     if callable(passthrough_prefixes):
         for raw_prefix in passthrough_prefixes():
@@ -104,6 +102,8 @@ def _profile_excludes_bpp_name(name: str, fmt: str, profile) -> bool:
                 continue
             if name == prefix.rstrip(".") or name.startswith(prefix):
                 return True
+    if fr.canonical_format_name(fmt) != "BF16":
+        return False
     return False
 
 
@@ -587,7 +587,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Assignment path or label=path. Solve-result JSONs are overlaid on base.",
     )
     parser.add_argument("--output", required=True)
-    parser.add_argument("--formats", default="NVFP4,MXFP8_E4M3,FP8_E4M3,BF16")
+    parser.add_argument("--formats", default="NVFP4,FP8_DYNAMIC,BF16")
     parser.add_argument("--n-calib-samples", type=int, default=2)
     parser.add_argument("--calib-seqlen", type=int, default=128)
     parser.add_argument("--calib-split", default="train")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
@@ -8,6 +9,7 @@ import pytest
 
 from prismaquant.kl_sensitivity_probe import _normalized_production_cache_levers
 from prismaquant.production_weight_cache import ProductionWeightCache
+from prismaquant.production_weight_cache import _format_supports_render_mechanism
 from prismaquant.production_weight_cache import fill_production_weight_cache
 from prismaquant.production_recache import (
     _load_assignment,
@@ -101,6 +103,27 @@ def test_recache_preload_respects_resident_budget(tmp_path):
     )
     assert stats["loaded"] == 2
     assert all(isinstance(cache.weights[k], torch.Tensor) for k in keys)
+
+
+def test_assignment_keys_ignore_uncached_packed_expert_entries(tmp_path):
+    torch.save(torch.ones((2, 2)), tmp_path / "dense.pt")
+    cache = ProductionWeightCache(
+        weights={("dense", "NVFP4"): "dense.pt"},
+        levers={},
+        cache_dir=str(tmp_path),
+    )
+
+    keys, missing = cache.assignment_keys(
+        {
+            "dense": "NVFP4",
+            "model.layers.0.mlp.experts.gate_up_proj": "NVFP4",
+            "model.layers.0.mlp.experts.down_proj": "MXFP8_E4M3",
+            "missing_dense": "NVFP4",
+        }
+    )
+
+    assert keys == [("dense", "NVFP4")]
+    assert missing == [("missing_dense", "NVFP4")]
 
 
 def test_production_cache_file_page_prefetch_does_not_load_tensors(tmp_path, monkeypatch):
@@ -234,6 +257,40 @@ def test_production_cache_records_nvfp4_scale_rule(monkeypatch):
     )
 
     assert cache.levers["nvfp4_scale_rule"] == "four_over_six_mse"
+
+
+def test_render_score_clips_nvfp4_but_not_dynamic_mxfp8(monkeypatch):
+    from prismaquant.production_weight_cache import _render_score_record
+
+    monkeypatch.setenv("PRISMAQUANT_DISABLE_RTN_COMPILE", "1")
+    reference = torch.eye(2, 32, dtype=torch.float32)
+    rendered = reference.clone()
+    activations = torch.linspace(-3.7, 5.9, 128, dtype=torch.float32).reshape(4, 32)
+
+    nvfp4 = _render_score_record(
+        qname="layer",
+        fmt="NVFP4",
+        render_format="NVFP4",
+        reference_weight=reference,
+        rendered_weight=rendered,
+        activations=activations,
+        activation_max_abs=0.5,
+    )
+    mxfp8 = _render_score_record(
+        qname="layer",
+        fmt="MXFP8_E4M3",
+        render_format="MXFP8_E4M3",
+        reference_weight=reference,
+        rendered_weight=rendered,
+        activations=activations,
+        activation_max_abs=0.5,
+    )
+
+    assert nvfp4["activation_clipped"] is True
+    assert nvfp4["activation_max_abs"] == 0.5
+    assert mxfp8["activation_clipped"] is False
+    assert mxfp8["activation_max_abs"] is None
+    assert mxfp8["activation_quantized"] is True
 
 
 def test_production_cache_unifies_activation_max_abs_for_profile_fused_siblings(
@@ -591,6 +648,263 @@ def test_production_cache_fp8_uses_activation_scale_sweep(monkeypatch):
     assert scale_meta["reasons"]["regressed_or_tied"] == 1
 
 
+def test_production_cache_fp8_e4m3_uses_gptq(monkeypatch):
+    import prismaquant.export_native_compressed as enc
+
+    model = _TinyChain()
+    calib_ids = torch.tensor([[0, 1]], dtype=torch.long)
+    calls = []
+
+    def fake_fp8_gptq(weight, activations, **kwargs):
+        calls.append((
+            activations.shape,
+            kwargs["fmt"],
+            kwargs["joint_scale_opt"],
+            kwargs["static_act_order"],
+        ))
+        rows, _cols = weight.shape
+        return (
+            torch.zeros_like(weight, dtype=torch.float8_e4m3fn),
+            torch.ones((rows, 1), dtype=torch.float32),
+            weight.detach().to(torch.float32),
+        )
+
+    monkeypatch.setenv("PRISMAQUANT_GPTQ_DAMP_SWEEP", "0")
+    monkeypatch.setattr(enc, "_gptq_obs_rounding_fp8_like", fake_fp8_gptq)
+
+    fill_production_weight_cache(
+        model,
+        calib_ids,
+        qnames=["l1"],
+        formats=["FP8_E4M3"],
+        levers={"gptq": True, "static_act_order": True, "scale_sweep": False},
+        max_act_rows=8,
+        progress=False,
+    )
+
+    assert calls == [(torch.Size([2, 32]), "FP8_E4M3", False, False)]
+
+
+def test_format_gate_disables_joint_scale_opt_for_mxfp8():
+    assert _format_supports_render_mechanism("NVFP4", "joint_scale_opt")
+    assert _format_supports_render_mechanism("NVFP4", "static_act_order")
+    assert _format_supports_render_mechanism("MXFP4", "gptq")
+    assert _format_supports_render_mechanism("MXFP4", "static_act_order")
+    assert not _format_supports_render_mechanism("MXFP4", "joint_scale_opt")
+    assert not _format_supports_render_mechanism("MXFP6_E3M2", "static_act_order")
+    assert not _format_supports_render_mechanism("MXFP6_E2M3", "static_act_order")
+    assert not _format_supports_render_mechanism("FP8_E4M3", "static_act_order")
+    assert not _format_supports_render_mechanism("FP8_E5M2", "static_act_order")
+    assert _format_supports_render_mechanism("MXFP8_E4M3", "static_act_order")
+    assert _format_supports_render_mechanism("MXFP8_E5M2", "static_act_order")
+    assert not _format_supports_render_mechanism("FP8_E4M3", "joint_scale_opt")
+    assert not _format_supports_render_mechanism("MXFP8_E4M3", "joint_scale_opt")
+    assert not _format_supports_render_mechanism("MXFP8_E5M2", "joint_scale_opt")
+
+
+def test_production_cache_non_nv_scale_sweep_refines_current_render(monkeypatch):
+    import prismaquant.export_native_compressed as enc
+    import prismaquant.production_weight_cache as pwc
+
+    model = _TinyChain()
+    calib_ids = torch.tensor([[0, 1]], dtype=torch.long)
+    scale_inputs = []
+
+    def fake_fp8_gptq(weight, activations, **kwargs):
+        rows, _cols = weight.shape
+        del activations, kwargs
+        return (
+            torch.zeros_like(weight, dtype=torch.float8_e4m3fn),
+            torch.ones((rows, 1), dtype=torch.float32),
+            weight.detach().to(torch.float32) + 1.0,
+        )
+
+    def fake_fp8_scale_sweep(weight, activations, **kwargs):
+        rows, _cols = weight.shape
+        del activations, kwargs
+        scale_inputs.append(weight.detach().clone())
+        return (
+            torch.zeros_like(weight, dtype=torch.float8_e4m3fn),
+            torch.ones((rows, 1), dtype=torch.float32),
+            weight.detach().to(torch.float32),
+        )
+
+    def fake_gate_score(reference_weight, rendered_weight, activations):
+        del activations
+        target = reference_weight.to(torch.float32) + 1.0
+        if torch.allclose(rendered_weight.to(torch.float32), target):
+            return 0.0, "output_mse"
+        return 1.0, "output_mse"
+
+    monkeypatch.setenv("PRISMAQUANT_GPTQ_DAMP_SWEEP", "0")
+    monkeypatch.setattr(enc, "_gptq_obs_rounding_fp8_like", fake_fp8_gptq)
+    monkeypatch.setattr(enc, "_fp8_dynamic_scale_sweep_quantize", fake_fp8_scale_sweep)
+    monkeypatch.setattr(pwc, "_render_score_for_gate", fake_gate_score)
+
+    fill_production_weight_cache(
+        model,
+        calib_ids,
+        qnames=["l1"],
+        formats=["FP8_E4M3"],
+        levers={"gptq": True, "scale_sweep": True},
+        max_act_rows=8,
+        progress=False,
+    )
+
+    assert scale_inputs
+    assert torch.allclose(
+        scale_inputs[0],
+        model.l1.weight.detach().to(torch.float32) + 1.0,
+    )
+
+
+def test_production_cache_mxfp8_e5m2_uses_gptq_without_joint_scale(monkeypatch):
+    import prismaquant.export_native_compressed as enc
+
+    model = _TinyChain()
+    calib_ids = torch.tensor([[0, 1]], dtype=torch.long)
+    calls = []
+
+    def fake_mxfp8_gptq(weight, activations, **kwargs):
+        calls.append((
+            activations.shape,
+            kwargs["fmt"],
+            kwargs["joint_scale_opt"],
+            kwargs["static_act_order"],
+        ))
+        rows, cols = weight.shape
+        return (
+            torch.zeros_like(weight, dtype=torch.float8_e5m2),
+            torch.zeros((rows, cols // 32), dtype=torch.uint8),
+            weight.detach().to(torch.float32),
+        )
+
+    monkeypatch.setenv("PRISMAQUANT_GPTQ_DAMP_SWEEP", "0")
+    monkeypatch.setattr(enc, "_gptq_obs_rounding_fp8_like", fake_mxfp8_gptq)
+
+    fill_production_weight_cache(
+        model,
+        calib_ids,
+        qnames=["l1"],
+        formats=["MXFP8_E5M2"],
+        levers={
+            "gptq": True,
+            "joint_scale_opt": True,
+            "static_act_order": True,
+            "scale_sweep": False,
+        },
+        max_act_rows=8,
+        progress=False,
+    )
+
+    assert calls == [
+        (torch.Size([2, 32]), "MXFP8_E5M2", False, False),
+        (torch.Size([2, 32]), "MXFP8_E5M2", False, True),
+    ]
+
+
+def test_production_cache_mxfp8_static_act_order_do_no_harm(monkeypatch):
+    import prismaquant.export_native_compressed as enc
+    import prismaquant.production_weight_cache as pwc
+
+    model = _TinyChain()
+    calib_ids = torch.tensor([[0, 1]], dtype=torch.long)
+    calls = []
+
+    def fake_mxfp8_gptq(weight, activations, **kwargs):
+        del activations
+        use_static = bool(kwargs["static_act_order"])
+        calls.append(use_static)
+        rows, cols = weight.shape
+        candidate = (
+            weight.detach().to(torch.float32) + (2.0 if use_static else 1.0)
+        )
+        return (
+            torch.zeros_like(weight, dtype=torch.float8_e4m3fn),
+            torch.zeros((rows, cols // 32), dtype=torch.uint8),
+            candidate,
+        )
+
+    def fake_gate_score(reference_weight, rendered_weight, activations):
+        del activations
+        target = reference_weight.to(torch.float32) + 1.0
+        return float((rendered_weight.to(torch.float32) - target).pow(2).sum()), "output_mse"
+
+    monkeypatch.setenv("PRISMAQUANT_GPTQ_DAMP_SWEEP", "0")
+    monkeypatch.setattr(enc, "_gptq_obs_rounding_fp8_like", fake_mxfp8_gptq)
+    monkeypatch.setattr(pwc, "_render_score_for_gate", fake_gate_score)
+
+    cache = fill_production_weight_cache(
+        model,
+        calib_ids,
+        qnames=["l1"],
+        formats=["MXFP8_E4M3"],
+        levers={"gptq": True, "static_act_order": True, "scale_sweep": False},
+        max_act_rows=8,
+        progress=False,
+    )
+
+    assert calls == [False, True]
+    assert torch.allclose(
+        cache.get("l1", "MXFP8_E4M3").to(torch.float32),
+        model.l1.weight.detach().to(torch.float32) + 1.0,
+    )
+    mechanisms = cache.metadata["render_gates"]["mechanisms"]
+    assert mechanisms["gptq"]["accepted"] == 1
+    assert mechanisms.get("static_act_order", {}).get("package_accepted", 0) == 0
+
+
+def test_production_cache_mxfp4_static_act_order_do_no_harm(monkeypatch):
+    import prismaquant.export_native_compressed as enc
+    import prismaquant.production_weight_cache as pwc
+
+    model = _TinyChain()
+    calib_ids = torch.tensor([[0, 1]], dtype=torch.long)
+    calls = []
+
+    def fake_mxfp4_gptq(weight, activations, **kwargs):
+        del activations
+        use_static = bool(kwargs["static_act_order"])
+        calls.append(use_static)
+        rows, cols = weight.shape
+        candidate = (
+            weight.detach().to(torch.float32) + (2.0 if use_static else 1.0)
+        )
+        return (
+            torch.zeros((rows, cols // 2), dtype=torch.uint8),
+            torch.zeros((rows, cols // 32), dtype=torch.uint8),
+            candidate,
+        )
+
+    def fake_gate_score(reference_weight, rendered_weight, activations):
+        del activations
+        target = reference_weight.to(torch.float32) + 1.0
+        return float((rendered_weight.to(torch.float32) - target).pow(2).sum()), "output_mse"
+
+    monkeypatch.setenv("PRISMAQUANT_GPTQ_DAMP_SWEEP", "0")
+    monkeypatch.setattr(enc, "_gptq_obs_rounding_mxfp4", fake_mxfp4_gptq)
+    monkeypatch.setattr(pwc, "_render_score_for_gate", fake_gate_score)
+
+    cache = fill_production_weight_cache(
+        model,
+        calib_ids,
+        qnames=["l1"],
+        formats=["MXFP4"],
+        levers={"gptq": True, "static_act_order": True, "scale_sweep": False},
+        max_act_rows=8,
+        progress=False,
+    )
+
+    assert calls == [False, True]
+    assert torch.allclose(
+        cache.get("l1", "MXFP4").to(torch.float32),
+        model.l1.weight.detach().to(torch.float32) + 1.0,
+    )
+    mechanisms = cache.metadata["render_gates"]["mechanisms"]
+    assert mechanisms["gptq"]["accepted"] == 1
+    assert mechanisms.get("static_act_order", {}).get("package_accepted", 0) == 0
+
+
 def test_fill_production_cache_assignment_scope_only_renders_selected_formats(
     monkeypatch,
 ):
@@ -623,6 +937,101 @@ def test_fill_production_cache_assignment_scope_only_renders_selected_formats(
     assert ("l2", "NVFP4") not in cache
     assert cache.metadata["render_scope"] == "assignment"
     assert cache.metadata["requested_entries"] == 1
+
+
+def test_production_cache_records_render_scores(monkeypatch, tmp_path):
+    import prismaquant.export_native_compressed as enc
+    import prismaquant.production_weight_cache as pwc
+
+    model = _TinyChain()
+    calib_ids = torch.tensor([[0, 1]], dtype=torch.long)
+
+    monkeypatch.setattr(
+        enc,
+        "_compute_nvfp4_joint_global",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        pwc,
+        "render_production_weight",
+        lambda weight, fmt, **_kwargs: weight.detach().to(torch.float32),
+    )
+
+    cache = fill_production_weight_cache(
+        model,
+        calib_ids,
+        qnames=["l1"],
+        formats=["NVFP4"],
+        levers={"gptq": False, "scale_sweep": False},
+        cache_dir=tmp_path,
+        max_act_rows=8,
+        progress=False,
+    )
+
+    scores = cache.metadata["render_scores"]["records"]
+    record = scores["l1|NVFP4"]
+    assert record["metric"] == "output_mse"
+    assert record["activation_rows"] == 2
+    assert record["normalizer"] == 64.0
+    assert record["score"] == pytest.approx(0.0)
+    assert (tmp_path / "render_scores.json").is_file()
+
+
+def test_resume_collects_activations_when_render_scores_missing(tmp_path):
+    import prismaquant.production_weight_cache as pwc
+
+    model = _TinyChain()
+    calib_ids = torch.tensor([[0, 1]], dtype=torch.long)
+    torch.save(
+        model.l1.weight.detach().to(torch.float32),
+        tmp_path / pwc._cache_weight_filename("l1", "NVFP4"),
+    )
+
+    cache = fill_production_weight_cache(
+        model,
+        calib_ids,
+        qnames=["l1"],
+        formats=["NVFP4"],
+        levers={"gptq": False, "scale_sweep": False},
+        cache_dir=tmp_path,
+        max_act_rows=8,
+        progress=False,
+    )
+
+    record = cache.metadata["render_scores"]["records"]["l1|NVFP4"]
+    assert record["activation_rows"] == 2
+    assert record["metric"] == "output_mse"
+    assert (tmp_path / "render_scores.json").is_file()
+
+
+def test_render_score_record_raises_on_activation_score_failure(monkeypatch):
+    import prismaquant.format_registry as fr
+    import prismaquant.production_weight_cache as pwc
+
+    def bad_activation_quantizer(_x):
+        raise RuntimeError("quantizer failed")
+
+    monkeypatch.setattr(
+        fr,
+        "get_format",
+        lambda _fmt: SimpleNamespace(
+            activation_quantize_dequantize=bad_activation_quantizer,
+        ),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="activation-aware render scoring failed for l1 @ FP8_E4M3",
+    ):
+        pwc._render_score_record(
+            qname="l1",
+            fmt="FP8_E4M3",
+            render_format="FP8_E4M3",
+            reference_weight=torch.eye(4),
+            rendered_weight=torch.eye(4),
+            activations=torch.randn(2, 4),
+            activation_max_abs=None,
+        )
 
 
 class _TinyChain(nn.Module):

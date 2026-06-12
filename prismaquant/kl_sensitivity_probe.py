@@ -3322,10 +3322,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--formats",
-        default="NVFP4,MXFP8_E4M3,FP8_E4M3,BF16",
+        default="NVFP4,FP8_DYNAMIC,BF16",
         help=(
             "'registry' or a comma-separated format list. Defaults to the "
-            "vLLM-backed production menu: NVFP4, MXFP8_E4M3, FP8_E4M3, BF16."
+            "vLLM-backed production menu: NVFP4, FP8_DYNAMIC, BF16. "
+            "MXFP8 remains available only when explicitly requested."
         ),
     )
     parser.add_argument("--pin", action="append", default=[])
@@ -3538,10 +3539,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--production-cache-levers",
-        default="gptq,joint_scale_opt",
+        default="gptq,static_act_order,joint_scale_opt",
         help=(
             "Comma-separated production cleanup levers for on-the-fly cache "
-            "builds. Default: gptq,joint_scale_opt. scale_sweep remains "
+            "builds. Default: gptq,static_act_order,joint_scale_opt. "
+            "scale_sweep remains "
             "available for explicit ablations but is no longer a production "
             "default. GPTQ damp-sweep follows PRISMAQUANT_GPTQ_DAMP_SWEEP and is "
             "recorded in cache metadata. NVFP4 block scaling follows "

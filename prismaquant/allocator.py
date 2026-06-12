@@ -69,8 +69,15 @@ Optional empirical calibration:
   producer for this payload is archived; production recipes normally run
   uncalibrated and validate assignments with direct KL measurement.
 
-Auto-Pareto knee via Kneedle (Satopää et al.). Reports the knee target
-plus a few flanking points so you can eyeball.
+Auto-Pareto knee via Kneedle (Satopää et al.). The primary recommendation
+uses a post-cliff log-error knee: when the frontier spans multiple orders of
+magnitude, the first half of the log-error range is treated as the
+catastrophic region and Kneedle is applied to the remaining operational
+frontier. The global log-error and raw-linear knees are still reported as
+diagnostics. (We implement Kneedle here rather than depend on the `kneed`
+PyPI package because the post-cliff log-error variant — trimming the
+catastrophic prefix before applying the knee — has no equivalent in `kneed`,
+and the curve is tiny so the dependency would not pay for itself.)
 """
 from __future__ import annotations
 
@@ -78,9 +85,10 @@ import argparse
 import csv
 import hashlib
 import json
+import math
 import pickle
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 from . import format_registry as fr
@@ -91,6 +99,7 @@ from .allocator_solver import (
     compute_assignment_predicted_dloss,
     promote_fused,
     promote_moe_pair,
+    promote_serving_units,
     solve_with_promotion,
 )
 from .allocator_candidates import (
@@ -110,6 +119,7 @@ from .serving_profiles import (
     resolve_target_profile,
     serving_profile_names,
 )
+from .decision_units import block_id_from_qname
 from .schemas import validate_cost_payload, validate_probe_payload
 
 
@@ -117,7 +127,7 @@ from .schemas import validate_cost_payload, validate_probe_payload
 # ---------------------------------------------------------------------------
 # Kneedle knee detection
 # ---------------------------------------------------------------------------
-def kneedle(x: list[float], y: list[float]) -> int:
+def _kneedle_convex_decreasing(x: list[float], y: list[float]) -> int:
     """Return index of the knee in a convex-decreasing curve."""
     if len(x) < 3:
         return 0
@@ -134,6 +144,112 @@ def kneedle(x: list[float], y: list[float]) -> int:
     diffs = [yn - (1.0 - xn) for xn, yn in zip(x_norm, y_norm)]
     # Convex-decreasing, so we want the most-negative diff (max dip).
     return min(range(len(diffs)), key=lambda i: diffs[i])
+
+
+def _log_error_values(y: list[float]) -> list[float]:
+    finite_positive = [
+        float(v) for v in y
+        if math.isfinite(float(v)) and float(v) > 0.0
+    ]
+    if not finite_positive:
+        return [0.0 for _ in y]
+    floor = max(min(finite_positive) * 1.0e-6, 1.0e-300)
+    return [math.log10(max(float(v), floor)) for v in y]
+
+
+def _log_error_tail_start(y: list[float]) -> int:
+    """Return the first index in the operational log-error frontier.
+
+    Full Pareto curves often contain a catastrophic low-bit prefix where error
+    drops by orders of magnitude before the useful shipping frontier starts.
+    Applying Kneedle over the whole log range can then select the transition
+    out of catastrophe instead of the real tradeoff knee. Trim that prefix once
+    the curve spans at least one decade, starting at the first point in the
+    lower half of the log-error range. Keep at least three points for Kneedle.
+    """
+    logs = _log_error_values(y)
+    if len(logs) < 3:
+        return 0
+    ymin, ymax = min(logs), max(logs)
+    if ymax - ymin < 1.0:
+        return 0
+    threshold = 0.5 * (ymin + ymax)
+    idx = next((i for i, v in enumerate(logs) if v <= threshold), 0)
+    return min(max(idx, 0), max(len(logs) - 3, 0))
+
+
+def kneedle_raw_linear(x: list[float], y: list[float]) -> int:
+    """Return the historical raw-error Kneedle index."""
+    return _kneedle_convex_decreasing(x, y)
+
+
+def kneedle_log_error_global(x: list[float], y: list[float]) -> int:
+    """Return Kneedle over the full log10(error) range."""
+    return _kneedle_convex_decreasing(x, _log_error_values(y))
+
+
+def kneedle_log_error(x: list[float], y: list[float]) -> int:
+    """Return the primary post-cliff Kneedle index on log10(error)."""
+    start = _log_error_tail_start(y)
+    local = _kneedle_convex_decreasing(
+        x[start:],
+        _log_error_values(y[start:]),
+    )
+    return start + local
+
+
+def kneedle(x: list[float], y: list[float]) -> int:
+    """Return the default allocator knee index.
+
+    The allocator's Δloss can span orders of magnitude. Running Kneedle
+    on raw error lets the largest point dominate the normalized curve and
+    tends to pick the first large absolute drop. Running Kneedle over the
+    full log-error range can still pick the transition out of catastrophic
+    error. The default therefore runs on the post-cliff log-error frontier;
+    global-log and raw-linear knees remain available for diagnostics and
+    backwards comparisons.
+    """
+    return kneedle_log_error(x, y)
+
+
+def _pareto_knee_summary(curve: list[dict]) -> dict:
+    feasible = [row for row in curve if row.get("feasible")]
+    if len(feasible) < 3:
+        return {"enabled": False, "reason": "too_few_feasible_points"}
+    xs = [float(r["achieved_bits"]) for r in feasible]
+    error_key = "predicted_dloss"
+    ys = [float(r.get(error_key, r["predicted_dloss"])) for r in feasible]
+
+    def _record(mode: str, idx: int) -> dict:
+        row = feasible[idx]
+        record = {
+            "mode": mode,
+            "target_bits": float(row["target_bits"]),
+            "achieved_bits": float(row["achieved_bits"]),
+            "predicted_dloss": float(row["predicted_dloss"]),
+            "kneedle_dloss": float(row.get(error_key, row["predicted_dloss"])),
+            "kneedle_error_source": error_key,
+            "index": int(idx),
+        }
+        for field in (
+            "aux_fixed_predicted_dloss",
+            "fixed_predicted_dloss",
+            "total_predicted_dloss_with_aux",
+        ):
+            if field in row:
+                record[field] = float(row[field])
+        return record
+
+    raw_idx = kneedle_raw_linear(xs, ys)
+    global_log_idx = kneedle_log_error_global(xs, ys)
+    log_idx = kneedle_log_error(xs, ys)
+    return {
+        "enabled": True,
+        "primary": "log_error",
+        "log_error": _record("log_error", log_idx),
+        "global_log_error": _record("global_log_error", global_log_idx),
+        "raw_linear": _record("raw_linear", raw_idx),
+    }
 
 
 
@@ -169,10 +285,10 @@ def _format_cli_choices() -> tuple[str, ...]:
 # `model.visual.blocks.*` Linears are zero — the knapsack DP has no
 # sensitivity signal to allocate on. Rather than let every visual Linear
 # default to the cheapest format or go through stale passthrough, we accept
-# a single uniform target format (`BF16`, `NVFP4`, or `MXFP8`) and assign
+# a single uniform target format (`BF16`, `NVFP4`, or `FP8_DYNAMIC`) and assign
 # every visual Linear to it. BF16 (the default) reproduces the previous
-# passthrough behavior; NVFP4/MXFP8 shrink the tower to quantized storage
-# using the same RTN math the body gets.
+# passthrough behavior; quantized formats shrink the tower to quantized
+# storage using the same math the body gets.
 #
 # Phase 2 (tracked separately) will replace this override with a real
 # multimodal Fisher: load images + text, run full forward through the
@@ -237,9 +353,263 @@ def apply_mtp_format_override(
     return out
 
 
-def _is_forced_mtp_passthrough(name: str, mtp_format: str) -> bool:
-    """True when MTP is explicitly kept outside the optimized budget."""
-    return str(name).startswith("mtp.") and fr.canonical_format_name(mtp_format) == "BF16"
+def _is_mtp_linear(name: str) -> bool:
+    """True when `name` refers to an MTP Linear-like quantization target."""
+    return str(name).startswith("mtp.")
+
+
+def _find_candidate_for_format(
+    candidates: dict[str, list[Candidate]],
+    name: str,
+    fmt: str,
+) -> Candidate | None:
+    """Return the scored candidate for `name` at canonical format `fmt`."""
+    canonical = fr.get_format(fmt).name
+    for cand in candidates.get(name, []):
+        if fr.get_format(cand.fmt).name == canonical:
+            return cand
+    return None
+
+
+# Role tokens used to bucket the bit-attribution report. Best-effort: anything
+# unrecognized buckets as "unknown" rather than failing, so new architectures
+# degrade gracefully instead of crashing a read-only diagnostic.
+_BIT_ATTR_KNOWN_ROLES = frozenset({
+    "q_proj", "k_proj", "v_proj", "o_proj", "qkv_proj",            # attention
+    "gate_proj", "up_proj", "down_proj", "gate_up_proj",           # MLP / fused
+    "in_proj_a", "in_proj_b", "in_proj_ba", "in_proj_qkv",         # linear attn
+    "in_proj_qkvz", "in_proj_z", "out_proj",
+    "lm_head", "embed_tokens",                                     # head / embed
+})
+
+
+def _parse_role_from_qname(qname: str) -> str:
+    """Best-effort role token for bit-attribution bucketing.
+
+    Distinguishes routed-expert and shared-expert projections from dense MLP
+    projections (so e.g. ``experts.7.down_proj`` does not collapse into the
+    dense ``down_proj`` bucket). Returns ``"unknown"`` on any name that doesn't
+    match a known pattern; this is a diagnostic, not a correctness path.
+    """
+    name = qname[4:] if qname.startswith("mtp.") else qname
+    parts = name.split(".")
+    if not parts:
+        return "unknown"
+    last = parts[-1]
+    # Unpacked routed expert: ...experts.<N>.<role>
+    if len(parts) >= 3 and parts[-2].isdigit() and "expert" in parts[-3]:
+        return f"expert.{last}" if last in _BIT_ATTR_KNOWN_ROLES else "expert.unknown"
+    # Packed routed expert (3D param, no per-expert index): ...experts.<role>
+    if len(parts) >= 2 and parts[-2] == "experts":
+        return f"expert.{last}" if last in _BIT_ATTR_KNOWN_ROLES else "expert.unknown"
+    # Shared expert: ...shared_expert(s).<role>
+    if len(parts) >= 2 and parts[-2] in ("shared_expert", "shared_experts"):
+        return f"shared_expert.{last}" if last in _BIT_ATTR_KNOWN_ROLES else "shared_expert.unknown"
+    if last in _BIT_ATTR_KNOWN_ROLES:
+        return last
+    return "unknown"
+
+
+def _bit_attr_block_sort_key(block_id: str) -> tuple:
+    """Sort layers.<N> numerically; non-layer blocks (lm_head, etc.) sort last."""
+    match = re.search(r"layers\.(\d+)", str(block_id))
+    if match:
+        return (0, int(match.group(1)), str(block_id))
+    return (1, 0, str(block_id))
+
+
+def _build_bit_attribution(
+    assignment_expanded: dict[str, str],
+    candidates: dict[str, list[Candidate]],
+    stats_entry_for,
+    format_specs: dict[str, "fr.FormatSpec"],
+) -> tuple[list[dict], list[dict], dict]:
+    """Build (buckets, per_linear_rows, body_totals) for the bit-attribution
+    report over the FINAL resolved body assignment.
+
+    Read-only: derives everything from the already-resolved assignment,
+    scored candidates, and probe stats. Visual / MTP Linears are excluded
+    (auxiliary to the body budget). Bits are recovered the same way
+    ``compute_achieved`` does, so the report's body bpp matches the artifact.
+    Entries with no scored candidate (expanded fused-sibling members, experts
+    priced at super-item granularity) report ``predicted_dloss=None`` rather
+    than fabricating a value.
+    """
+    buckets: dict[tuple[str, str], dict] = {}
+    per_linear: list[dict] = []
+    body_bits = 0.0
+    body_params = 0
+
+    for name, fmt in assignment_expanded.items():
+        if _is_visual_linear(name) or _is_mtp_linear(name):
+            continue
+        entry = stats_entry_for(name)
+        n_params = None
+        h_trace = None
+        if isinstance(entry, dict):
+            if entry.get("n_params") is not None:
+                n_params = int(entry["n_params"])
+            if entry.get("h_trace") is not None:
+                h_trace = float(entry["h_trace"])
+
+        cand = _find_candidate_for_format(candidates, name, fmt)
+        bits = None
+        pred_dloss = None
+        if cand is not None:
+            bits = 8.0 * cand.memory_bytes
+            pred_dloss = float(getattr(cand, "predicted_dloss", 0.0))
+        elif isinstance(entry, dict):
+            mem_map = entry.get("_memory_bytes_by_format")
+            if isinstance(mem_map, dict) and fmt in mem_map:
+                bits = 8.0 * mem_map[fmt]
+            elif fmt in format_specs and n_params:
+                shape = _shape_from_stats(entry)
+                bits = format_specs[fmt].effective_bits_for_shape(shape) * n_params
+
+        bpp = (bits / n_params) if (bits is not None and n_params) else None
+        block_id = block_id_from_qname(name)
+        role = _parse_role_from_qname(name)
+        per_linear.append({
+            "qname": name,
+            "block_id": block_id,
+            "role": role,
+            "format": fmt,
+            "bits": bits,
+            "bpp": bpp,
+            "n_params": n_params,
+            "h_trace": h_trace,
+            "predicted_dloss": pred_dloss,
+        })
+
+        bucket = buckets.setdefault((block_id, role), {
+            "block_id": block_id,
+            "role": role,
+            "n_linears": 0,
+            "bits_total": 0.0,
+            "n_params_total": 0,
+            "format_counts": defaultdict(int),
+            "sum_predicted_dloss": 0.0,
+            "predicted_dloss_n": 0,
+            "sum_h_trace": 0.0,
+            "h_trace_n": 0,
+        })
+        bucket["n_linears"] += 1
+        bucket["format_counts"][fmt] += 1
+        if bits is not None:
+            bucket["bits_total"] += bits
+            body_bits += bits
+        if n_params:
+            bucket["n_params_total"] += n_params
+            body_params += n_params
+        if pred_dloss is not None:
+            bucket["sum_predicted_dloss"] += pred_dloss
+            bucket["predicted_dloss_n"] += 1
+        if h_trace is not None:
+            bucket["sum_h_trace"] += h_trace
+            bucket["h_trace_n"] += 1
+
+    bucket_list: list[dict] = []
+    for bucket in buckets.values():
+        n_params_total = bucket["n_params_total"]
+        bucket_list.append({
+            "block_id": bucket["block_id"],
+            "role": bucket["role"],
+            "n_linears": bucket["n_linears"],
+            "bits_total": bucket["bits_total"],
+            "n_params_total": n_params_total,
+            "mean_bpp": (bucket["bits_total"] / n_params_total) if n_params_total else None,
+            "format_counts": dict(bucket["format_counts"]),
+            "sum_predicted_dloss": (
+                bucket["sum_predicted_dloss"] if bucket["predicted_dloss_n"] else None),
+            "predicted_dloss_coverage": f"{bucket['predicted_dloss_n']}/{bucket['n_linears']}",
+            "sum_h_trace": bucket["sum_h_trace"] if bucket["h_trace_n"] else None,
+        })
+
+    bucket_list.sort(key=lambda r: (_bit_attr_block_sort_key(r["block_id"]), r["role"]))
+    per_linear.sort(key=lambda r: (_bit_attr_block_sort_key(r["block_id"]), r["role"], r["qname"]))
+    totals = {
+        "body_bits": body_bits,
+        "body_quantizable_params": body_params,
+        "body_bits_per_param": (body_bits / body_params) if body_params else None,
+        "n_body_linears": len(per_linear),
+    }
+    return bucket_list, per_linear, totals
+
+
+def _write_bit_attribution_reports(
+    json_path: str | None,
+    csv_path: str | None,
+    *,
+    target_bits: float,
+    achieved_bits: float,
+    assignment_expanded: dict[str, str],
+    candidates: dict[str, list[Candidate]],
+    stats_entry_for,
+    format_specs: dict[str, "fr.FormatSpec"],
+) -> None:
+    """Write the bit-attribution JSON / CSV and print a compact per-role rollup.
+
+    No-op when neither output path is set."""
+    if not json_path and not csv_path:
+        return
+    buckets, per_linear, totals = _build_bit_attribution(
+        assignment_expanded, candidates, stats_entry_for, format_specs)
+
+    if json_path:
+        payload = {
+            "schema": "prismaquant.allocator.bit_attribution.v1",
+            "target_bits": float(target_bits),
+            "achieved_bits": float(achieved_bits),
+            "body_bits_per_param": totals["body_bits_per_param"],
+            "body_quantizable_params": totals["body_quantizable_params"],
+            "n_body_linears": totals["n_body_linears"],
+            "buckets": buckets,
+        }
+        path = Path(json_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2) + "\n")
+        print(f"[alloc] bit attribution (per block/role) → {path}", flush=True)
+
+    if csv_path:
+        path = Path(csv_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow([
+                "qname", "block_id", "role", "format",
+                "bits", "bpp", "n_params", "h_trace", "predicted_dloss",
+            ])
+            for row in per_linear:
+                writer.writerow([
+                    row["qname"], row["block_id"], row["role"], row["format"],
+                    "" if row["bits"] is None else f"{row['bits']:.6g}",
+                    "" if row["bpp"] is None else f"{row['bpp']:.6g}",
+                    "" if row["n_params"] is None else row["n_params"],
+                    "" if row["h_trace"] is None else f"{row['h_trace']:.6g}",
+                    "" if row["predicted_dloss"] is None else f"{row['predicted_dloss']:.6g}",
+                ])
+        print(f"[alloc] bit attribution (per Linear) → {path}", flush=True)
+
+    # Compact stdout rollup by role across all blocks — the at-a-glance answer
+    # to "where did the budget go?" without opening the JSON.
+    role_roll: dict[str, dict] = {}
+    for row in per_linear:
+        agg = role_roll.setdefault(row["role"], {
+            "n": 0, "bits": 0.0, "params": 0, "fmts": defaultdict(int)})
+        agg["n"] += 1
+        agg["fmts"][row["format"]] += 1
+        if row["bits"] is not None:
+            agg["bits"] += row["bits"]
+        if row["n_params"]:
+            agg["params"] += row["n_params"]
+    print("[alloc] bit attribution by role (body only):", flush=True)
+    for role in sorted(role_roll, key=lambda r: -(role_roll[r]["bits"])):
+        agg = role_roll[role]
+        mean_bpp = (agg["bits"] / agg["params"]) if agg["params"] else float("nan")
+        fmt_mix = " ".join(
+            f"{fmt}:{n}" for fmt, n in sorted(agg["fmts"].items(), key=lambda kv: -kv[1]))
+        print(f"    {role:>22}  n={agg['n']:>4}  mean_bpp={mean_bpp:6.3f}  [{fmt_mix}]",
+              flush=True)
 
 
 def discover_visual_linears_from_source(model_path: str) -> list[str]:
@@ -419,6 +789,29 @@ def main():
                          "'calibrated_gains[fmt] = α_fmt'. When present, "
                          "the per-(layer, format) predicted Δloss "
                          "is multiplied by α_fmt before the DP runs.")
+    ap.add_argument("--propagated-sensitivity-report", default=None,
+                    help="Optional sensitivity_propagated_group_report JSON. "
+                         "When provided, propagated KL is folded into the "
+                         "allocator costs before candidate construction.")
+    ap.add_argument("--propagated-sensitivity-scale", type=float, default=1.0,
+                    help="Multiplier for --propagated-sensitivity-report "
+                         "penalties. The report's current-format unit KL "
+                         "is preserved at scale=1 and distributed once over "
+                         "fused siblings by added-bit share.")
+    ap.add_argument("--propagated-sensitivity-score-field",
+                    default="propagated_kl",
+                    help="Numeric report row field to fold into allocator "
+                         "costs when --propagated-sensitivity-report is set.")
+    ap.add_argument("--propagated-sensitivity-format-extrapolation",
+                    choices=("local_mse_ratio", "current_only", "bits_interp"),
+                    default="local_mse_ratio",
+                    help="How to extrapolate measured current-format "
+                         "propagated sensitivity across alternative "
+                         "candidate formats.")
+    ap.add_argument("--propagated-sensitivity-target-format", default=None,
+                    help="Override target format for propagated-sensitivity "
+                         "bit-share accounting. Defaults to the report's "
+                         "target_format.")
     ap.add_argument("--overshoot-tolerance", type=float, default=0.01,
                     help="Maximum allowed overshoot (bits/param) of the "
                          "achieved budget over the requested target after "
@@ -433,27 +826,34 @@ def main():
                          "--visual-sensitivity=uniform OR when --visual-"
                          "sensitivity=fisher but the probe / cost pickles "
                          "don't carry real visual Fisher data. BF16 (default) "
-                         "reproduces passthrough behavior; NVFP4 / MXFP8 "
-                         "shrink the tower to quantized storage via the "
+                         "reproduces passthrough behavior; NVFP4 / "
+                         "FP8_DYNAMIC shrink the tower to quantized storage via the "
                          "existing RTN math at export time.")
     ap.add_argument("--visual-sensitivity",
                     choices=["fisher", "uniform"],
                     default="fisher",
-                    help="How visual-encoder Linears enter the allocator. "
-                         "'fisher' (default) treats them as regular DP "
-                         "candidates when the probe pickle carries real "
-                         "multimodal Fisher stats (produced by "
-                         "`incremental_probe --calibration-modality="
-                         "multimodal`). If those stats are missing, falls "
-                         "back to uniform --visual-format. 'uniform' forces "
-                         "the Phase 1 path: every visual Linear gets "
-                         "--visual-format regardless of what's in the probe.")
+                    help="How visual-encoder Linears are assigned. Visual "
+                         "Linears are auxiliary to the language-model budget: "
+                         "they are stamped with --visual-format and excluded "
+                         "from default bpp/Δloss accounting. 'fisher' keeps "
+                         "measured visual cost rows available for audit "
+                         "metadata when present; 'uniform' uses only the "
+                         "Phase 1 source-scan override.")
     ap.add_argument("--mtp-format",
                     choices=_format_cli_choices(),
                     default="BF16",
                     help="Uniform format for MTP Linears. BF16 is the "
                          "production default until MTP speculative-decode "
                          "acceptance is validated for quantized MTP weights.")
+    ap.add_argument("--bit-attribution-json", default=None,
+                    help="Optional path: write a read-only 'where did the "
+                         "budget go' report bucketing the final body "
+                         "assignment by (block, role) with per-bucket bpp, "
+                         "format mix, summed predicted_dloss and h_trace.")
+    ap.add_argument("--bit-attribution-csv", default=None,
+                    help="Optional path: write the flat per-Linear bit "
+                         "attribution table (qname, block, role, format, "
+                         "bits, bpp, n_params, h_trace, predicted_dloss).")
     args = ap.parse_args()
 
     if args.threads > 0:
@@ -496,22 +896,46 @@ def main():
     costs = cost_data["costs"]
     print(f"[alloc] stats: {len(stats)} Linears, costs: {len(costs)} Linears")
 
-    forced_passthrough_assignment: dict[str, str] = {}
     allocation_excluded = []
     for name in sorted(set(stats) | set(costs)):
         if model_profile.is_pinned_name(name):
-            allocation_excluded.append(name)
-        elif _is_forced_mtp_passthrough(name, args.mtp_format):
-            forced_passthrough_assignment[name] = args.mtp_format
             allocation_excluded.append(name)
     if allocation_excluded:
         excluded = set(allocation_excluded)
         stats = {name: value for name, value in stats.items() if name not in excluded}
         costs = {name: value for name, value in costs.items() if name not in excluded}
         print(
-            "[alloc] forced passthrough excluded from DP budget: "
+            "[alloc] profile-pinned names excluded from DP budget: "
             f"{len(allocation_excluded)} Linears "
             f"(sample: {allocation_excluded[:8]})",
+            flush=True,
+        )
+    accounting_stats = dict(stats)
+
+    propagated_sensitivity_summary: dict | None = None
+    if args.propagated_sensitivity_report:
+        from .propagated_sensitivity_costs import (
+            apply_propagated_sensitivity_penalty,
+        )
+
+        with open(args.propagated_sensitivity_report) as f:
+            propagated_report = json.load(f)
+        costs, propagated_sensitivity_summary = apply_propagated_sensitivity_penalty(
+            costs,
+            stats=stats,
+            report=propagated_report,
+            scale=float(args.propagated_sensitivity_scale),
+            target_format=args.propagated_sensitivity_target_format,
+            score_field=args.propagated_sensitivity_score_field,
+            format_extrapolation=args.propagated_sensitivity_format_extrapolation,
+        )
+        print(
+            "[alloc] propagated sensitivity costs: "
+            f"report={args.propagated_sensitivity_report} "
+            f"scale={propagated_sensitivity_summary['scale']:.6g} "
+            f"adjusted={propagated_sensitivity_summary['adjusted_entries']} "
+            f"skipped={propagated_sensitivity_summary['skipped']} "
+            f"penalty={propagated_sensitivity_summary['total_scaled_member_penalty']:.6g}",
             flush=True,
         )
 
@@ -543,16 +967,22 @@ def main():
                "noise, which is usually not what you want:\n"
                + "\n".join(f"  {k} bits: {v}" for k, v in collisions.items())
                + "\nRecommended bundles (vLLM serving, today):\n"
-               "  Ship-ready     : NVFP4,MXFP8       (validated)\n"
-               "  MX-pure        : MXFP4,MXFP8\n"
-               "  Experimental   : NVFP4,MXFP6_E3M2,MXFP8   "
+               "  Production     : NVFP4,FP8_DYNAMIC,BF16\n"
+               "  MX research    : MXFP4,MXFP8_E4M3,BF16\n"
+               "  Experimental   : NVFP4,MXFP6_E3M2,FP8_DYNAMIC,BF16   "
                "(MXFP6 hardware-supported on Blackwell, vLLM kernels not yet landed)")
         if args.enforce_family_coherence:
             raise SystemExit(f"[alloc] ERROR: {msg}")
         else:
             print(f"[alloc] WARNING: {msg}", flush=True)
-    format_rank = {s.name: i for i, s in enumerate(specs_sorted)}
-    format_specs = {s.name: s for s in specs}
+    mtp_format_canonical = fr.get_format(args.mtp_format).name
+    visual_format_canonical = fr.get_format(args.visual_format).name
+    rank_specs = {s.name: s for s in specs_sorted}
+    rank_specs.setdefault(mtp_format_canonical, fr.get_format(mtp_format_canonical))
+    rank_specs.setdefault(visual_format_canonical, fr.get_format(visual_format_canonical))
+    rank_specs_sorted = sorted(rank_specs.values(), key=lambda s: s.effective_bits)
+    format_rank = {s.name: i for i, s in enumerate(rank_specs_sorted)}
+    format_specs = {s.name: s for s in rank_specs_sorted}
     print(f"[alloc] formats (low→high bits): "
           f"{[f'{s.name}({s.effective_bits:.2f}b)' for s in specs_sorted]}")
 
@@ -599,12 +1029,150 @@ def main():
     )
     print(f"[alloc] candidates built for {len(candidates)} Linears")
 
-    applicability_report_path = (
-        Path(args.applicability_report)
-        if args.applicability_report
-        else Path(args.pareto_csv).with_name("format_applicability.json")
+    fixed_format_assignment: dict[str, str] = {}
+    fixed_stats: dict[str, dict] = {}
+    fixed_chosen_candidates: dict[str, Candidate] = {}
+    mtp_names_without_costs = sorted(
+        n for n in stats if _is_mtp_linear(n) and n not in costs
     )
-    applicability_report_path.parent.mkdir(parents=True, exist_ok=True)
+    if mtp_names_without_costs and mtp_format_canonical != "BF16":
+        sample = ", ".join(mtp_names_without_costs[:8])
+        raise SystemExit(
+            f"[alloc] --mtp-format={mtp_format_canonical} was requested, "
+            f"but the cost pickle lacks {len(mtp_names_without_costs)} MTP "
+            f"Linear(s). Sample: {sample}. Re-run cost measurement with "
+            "--include-mtp."
+        )
+    if mtp_names_without_costs:
+        print(
+            "[alloc] WARNING: probe has MTP Linears absent from the cost "
+            f"pickle; leaving {len(mtp_names_without_costs)} MTP Linears "
+            "out of allocator accounting. Re-run cost measurement with "
+            "--include-mtp to budget them explicitly.",
+            flush=True,
+        )
+    mtp_names = sorted(n for n in stats if _is_mtp_linear(n) and n in costs)
+    if mtp_names:
+        mtp_stats = {name: stats[name] for name in mtp_names}
+        mtp_costs = {name: costs[name] for name in mtp_names}
+        mtp_candidates = build_candidates(
+            mtp_stats,
+            mtp_costs,
+            [fr.get_format(mtp_format_canonical)],
+            calibrated_gains,
+            source_manifest=source_manifest,
+            target_profile=target_profile,
+            mask_records=candidate_mask_records,
+        )
+        missing_mtp_candidates = [
+            name for name in mtp_names
+            if _find_candidate_for_format(
+                mtp_candidates,
+                name,
+                mtp_format_canonical,
+            ) is None
+        ]
+        if missing_mtp_candidates:
+            sample = ", ".join(missing_mtp_candidates[:8])
+            raise SystemExit(
+                f"[alloc] --mtp-format={mtp_format_canonical} requires "
+                "measured, serveable MTP cost candidates, but "
+                f"{len(missing_mtp_candidates)} MTP Linear(s) are missing "
+                f"that candidate. Sample: {sample}. Re-run cost measurement "
+                "with --include-mtp for the requested MTP format."
+            )
+        fixed_format_assignment = {
+            name: mtp_format_canonical for name in mtp_names
+        }
+        fixed_stats = {name: stats[name] for name in mtp_names}
+        fixed_chosen_candidates = {
+            name: _find_candidate_for_format(
+                mtp_candidates,
+                name,
+                mtp_format_canonical,
+            )
+            for name in mtp_names
+        }
+        fixed_chosen_candidates = {
+            name: cand for name, cand in fixed_chosen_candidates.items()
+            if cand is not None
+        }
+        if fixed_format_assignment:
+            fixed_names = set(fixed_format_assignment)
+            stats = {
+                name: value for name, value in stats.items()
+                if name not in fixed_names
+            }
+            costs = {
+                name: value for name, value in costs.items()
+                if name not in fixed_names
+            }
+            candidates = {
+                name: value for name, value in candidates.items()
+                if name not in fixed_names
+            }
+            print(
+                f"[alloc] --mtp-format={mtp_format_canonical}: fixed "
+                f"{len(fixed_format_assignment)} MTP Linears before DP "
+                "as auxiliary to body bpp/Δloss accounting",
+                flush=True,
+            )
+
+    visual_names = sorted(n for n in stats if _is_visual_linear(n))
+    visual_aux_candidates: dict[str, Candidate] = {}
+    if visual_names:
+        visual_cost_names = [name for name in visual_names if name in costs]
+        if visual_cost_names and args.visual_sensitivity == "fisher":
+            visual_stats = {name: stats[name] for name in visual_cost_names}
+            visual_costs = {name: costs[name] for name in visual_cost_names}
+            visual_candidates = build_candidates(
+                visual_stats,
+                visual_costs,
+                [fr.get_format(visual_format_canonical)],
+                calibrated_gains,
+                source_manifest=source_manifest,
+                target_profile=target_profile,
+                mask_records=candidate_mask_records,
+            )
+            visual_aux_candidates = {
+                name: cand for name in visual_cost_names
+                if (
+                    cand := _find_candidate_for_format(
+                        visual_candidates,
+                        name,
+                        visual_format_canonical,
+                    )
+                ) is not None
+            }
+        fixed_format_assignment.update({
+            name: visual_format_canonical for name in visual_names
+        })
+        fixed_stats.update({name: stats[name] for name in visual_names})
+        fixed_chosen_candidates.update(visual_aux_candidates)
+        visual_names_set = set(visual_names)
+        stats = {
+            name: value for name, value in stats.items()
+            if name not in visual_names_set
+        }
+        costs = {
+            name: value for name, value in costs.items()
+            if name not in visual_names_set
+        }
+        candidates = {
+            name: value for name, value in candidates.items()
+            if name not in visual_names_set
+        }
+        print(
+            f"[alloc] --visual-format={visual_format_canonical}: fixed "
+            f"{len(visual_names)} visual Linears as auxiliary to body "
+            f"bpp/Δloss accounting"
+            + (
+                f" ({len(visual_aux_candidates)} measured cost rows tracked)"
+                if visual_aux_candidates else ""
+            ),
+            flush=True,
+        )
+
     pre_aggregation_availability = {
         spec.name: sum(
             1 for per_name in candidates.values()
@@ -612,6 +1180,31 @@ def main():
         )
         for spec in specs_sorted
     }
+
+    fixed_total_params = sum(
+        int(entry.get("n_params", 0) or 0) for entry in fixed_stats.values()
+    )
+
+    def _bits_for_stats_entry(entry: dict, fmt: str) -> float:
+        shape = _shape_from_stats(entry)
+        return 8.0 * fr.get_format(fmt).memory_bytes_for_shape(shape)
+
+    fixed_total_bits = sum(
+        _bits_for_stats_entry(fixed_stats[name], fmt)
+        for name, fmt in fixed_format_assignment.items()
+        if name in fixed_stats
+    )
+    fixed_total_dloss = sum(
+        float(cand.predicted_dloss)
+        for cand in fixed_chosen_candidates.values()
+    )
+
+    applicability_report_path = (
+        Path(args.applicability_report)
+        if args.applicability_report
+        else Path(args.pareto_csv).with_name("format_applicability.json")
+    )
+    applicability_report_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Pre-aggregate fused siblings (qkv_proj, gate_up_proj, ...) into
     # single DP items. The DP can't pick mixed-sibling solutions because
@@ -636,6 +1229,18 @@ def main():
         )
         for spec in specs_sorted
     }
+    mutable_total_params = sum(
+        int(stats[n].get("n_params", 0) or 0) for n in candidates
+    )
+    if fixed_total_params:
+        fixed_bpp = fixed_total_bits / max(fixed_total_params, 1)
+        print(
+            "[alloc] auxiliary fixed-format contribution "
+            "(excluded from body budget/loss): "
+            f"{fixed_total_params:,} params, {fixed_bpp:.4f} bpp, "
+            f"Δloss={fixed_total_dloss:.4e}",
+            flush=True,
+        )
     applicability_payload = {
         "schema": "prismaquant.format_applicability.v1",
         "target_profile": target_profile,
@@ -643,8 +1248,24 @@ def main():
         "formats": [spec.name for spec in specs_sorted],
         "probe": str(args.probe),
         "costs": str(args.costs),
+        "propagated_sensitivity_costs": propagated_sensitivity_summary,
         "pre_aggregation_candidate_availability": pre_aggregation_availability,
         "post_aggregation_candidate_availability": post_aggregation_availability,
+        "fixed_format_assignment": {
+            "mtp_format": mtp_format_canonical,
+            "visual_format": visual_format_canonical,
+            "linears": len(fixed_format_assignment),
+            "linears_by_kind": dict(Counter(
+                "mtp" if _is_mtp_linear(name)
+                else "visual" if _is_visual_linear(name)
+                else "other"
+                for name in fixed_format_assignment
+            )),
+            "params": fixed_total_params,
+            "bits_total": fixed_total_bits,
+            "predicted_dloss": fixed_total_dloss,
+            "budget_scope": "auxiliary_excluded_from_body_budget",
+        },
         **summarize_applicability_masks(candidate_mask_records),
     }
     applicability_report_path.write_text(
@@ -652,22 +1273,44 @@ def main():
     )
     print(f"[alloc] format applicability → {applicability_report_path}")
 
+    def _stats_entry_for_assignment_name(name: str) -> dict | None:
+        entry = stats.get(name)
+        if isinstance(entry, dict):
+            return entry
+        fixed_entry = fixed_stats.get(name)
+        if isinstance(fixed_entry, dict):
+            return fixed_entry
+        original_entry = accounting_stats.get(name)
+        if isinstance(original_entry, dict):
+            return original_entry
+        return None
+
     def _solve_for_target(target_bits: float):
-        """Solve the DP at one target bit budget."""
+        """Solve the body-budget DP at one target bit budget."""
+        mutable_target_bits = float(target_bits)
+        if mutable_total_params <= 0:
+            if fixed_total_params > 0 and mutable_target_bits >= 0.0:
+                return {}, 0.0, 0.0, 0.0
+            return None, float("nan"), float("inf"), float("inf")
+        if mutable_target_bits < 0.0:
+            return None, float("nan"), float("inf"), float("inf")
         assign, achieved_r = solve_with_promotion(
-            stats, candidates, target_bits, format_specs, format_rank,
+            stats, candidates, mutable_target_bits, format_specs, format_rank,
             args.bit_precision,
             no_fused_promote=args.no_fused_promote,
             overshoot_tolerance=args.overshoot_tolerance,
             profile=model_profile,
         )
         if assign is None:
-            return None, float("nan"), float("inf")
-        total = compute_assignment_predicted_dloss(assign, candidates)
-        return assign, achieved_r, total
+            return None, float("nan"), float("inf"), float("inf")
+        mutable_total = compute_assignment_predicted_dloss(assign, candidates)
+        total = mutable_total
+        return assign, achieved_r, total, mutable_total
 
     def _expand_assignment_for_seed_json(
         assignment: dict[str, str],
+        *,
+        include_auxiliary: bool = True,
     ) -> dict[str, str]:
         """Expand DP super-items into the per-Linear seed-assignment shape.
 
@@ -680,13 +1323,14 @@ def main():
         expanded = dict(assignment)
         if not args.no_fused_aggregation:
             expanded = expand_fused_sibling_assignment(expanded, stats)
-        expanded.update(forced_passthrough_assignment)
-        return promote_moe_pair(expanded, format_rank, profile=model_profile)
+        if include_auxiliary:
+            expanded.update(fixed_format_assignment)
+        return promote_serving_units(expanded, format_rank, profile=model_profile)
 
     def _assignment_bits_total(assignment: dict[str, str]) -> float:
         total = 0.0
         for name, fmt in assignment.items():
-            entry = stats.get(name)
+            entry = _stats_entry_for_assignment_name(name)
             if not isinstance(entry, dict):
                 continue
             shape = _shape_from_stats(entry)
@@ -699,7 +1343,7 @@ def main():
     targets = [float(x) for x in args.pareto_targets.split(",")]
     curve = []
     for t in targets:
-        assign, achieved, total = _solve_for_target(t)
+        assign, achieved, total, mutable_total = _solve_for_target(t)
         if assign is None:
             curve.append({"target_bits": t, "feasible": False})
             continue
@@ -707,22 +1351,30 @@ def main():
         format_params = defaultdict(int)
         for name, fmt in assign.items():
             format_counts[fmt] += 1
-            format_params[fmt] += stats[name]["n_params"]
+            entry = _stats_entry_for_assignment_name(name)
+            if isinstance(entry, dict):
+                format_params[fmt] += int(entry.get("n_params", 0) or 0)
+        total_with_aux = total + fixed_total_dloss
         curve.append({
             "target_bits": t,
             "feasible": True,
             "achieved_bits": achieved,
             "predicted_dloss": total,
+            "variable_predicted_dloss": mutable_total,
+            "aux_fixed_predicted_dloss": fixed_total_dloss,
+            "fixed_predicted_dloss": fixed_total_dloss,
+            "total_predicted_dloss_with_aux": total_with_aux,
+            "aux_fixed_bits_total": fixed_total_bits,
+            "aux_fixed_params": fixed_total_params,
             **{f"layers_{k}": v for k, v in format_counts.items()},
             **{f"params_{k}": v for k, v in format_params.items()},
         })
         if args.pareto_output_dir:
             expanded = _expand_assignment_for_seed_json(assign)
-            if any(name.startswith("mtp.") for name in expanded):
-                expanded = apply_mtp_format_override(
-                    expanded,
-                    args.mtp_format,
-                )
+            budget_expanded = _expand_assignment_for_seed_json(
+                assign,
+                include_auxiliary=False,
+            )
             expanded_counts = defaultdict(int)
             for fmt in expanded.values():
                 expanded_counts[fmt] += 1
@@ -730,9 +1382,14 @@ def main():
                 "target_bits": float(t),
                 "achieved_bits": float(achieved),
                 "predicted_dloss": float(total),
+                "variable_predicted_dloss": float(mutable_total),
+                "aux_fixed_predicted_dloss": float(fixed_total_dloss),
+                "fixed_predicted_dloss": float(fixed_total_dloss),
+                "total_predicted_dloss_with_aux": float(total_with_aux),
                 "assignment": expanded,
                 "format_counts": dict(sorted(expanded_counts.items())),
-                "bits_total": _assignment_bits_total(expanded),
+                "bits_total": _assignment_bits_total(budget_expanded),
+                "bits_total_with_aux": _assignment_bits_total(expanded),
             })
 
     # Output Pareto CSV
@@ -743,6 +1400,10 @@ def main():
         for row in curve:
             w.writerow(row)
     print(f"[alloc] Pareto curve → {args.pareto_csv}")
+    knee_summary = _pareto_knee_summary(curve)
+    knee_path = Path(args.pareto_csv).with_suffix(".knees.json")
+    knee_path.write_text(json.dumps(knee_summary, indent=2, sort_keys=True) + "\n")
+    print(f"[alloc] Pareto knees → {knee_path}")
 
     if args.pareto_output_dir:
         out_dir = Path(args.pareto_output_dir)
@@ -768,7 +1429,11 @@ def main():
                 "target_bits": float(record["target_bits"]),
                 "achieved_bits": float(record["achieved_bits"]),
                 "bits_total": float(record["bits_total"]),
+                "bits_total_with_aux": float(record["bits_total_with_aux"]),
                 "predicted_dloss": float(record["predicted_dloss"]),
+                "total_predicted_dloss_with_aux": float(
+                    record["total_predicted_dloss_with_aux"]
+                ),
                 "format_counts": record["format_counts"],
                 "assignment": dict(sorted(assignment.items())),
             }
@@ -779,15 +1444,26 @@ def main():
                 "target_bits": float(record["target_bits"]),
                 "achieved_bits": float(record["achieved_bits"]),
                 "bits_total": float(record["bits_total"]),
+                "bits_total_with_aux": float(record["bits_total_with_aux"]),
                 "predicted_dloss": float(record["predicted_dloss"]),
+                "total_predicted_dloss_with_aux": float(
+                    record["total_predicted_dloss_with_aux"]
+                ),
+                "variable_predicted_dloss": float(record["variable_predicted_dloss"]),
+                "aux_fixed_predicted_dloss": float(
+                    record["aux_fixed_predicted_dloss"]
+                ),
+                "fixed_predicted_dloss": float(record["fixed_predicted_dloss"]),
                 "format_counts": record["format_counts"],
             })
         (out_dir / "manifest.json").write_text(json.dumps({
             "schema": "prismaquant.allocator.pareto_manifest.v1",
             "probe": str(args.probe),
             "costs": str(args.costs),
+            "propagated_sensitivity_costs": propagated_sensitivity_summary,
             "formats": [s.name for s in specs_sorted],
             "target_bits": [float(x) for x in targets],
+            "knees": knee_summary,
             "candidates": manifest_rows,
         }, indent=2, sort_keys=True) + "\n")
         print(
@@ -797,17 +1473,21 @@ def main():
         )
 
     # Kneedle
-    feasible = [row for row in curve if row.get("feasible")]
-    if len(feasible) >= 3:
-        kidx = kneedle([r["achieved_bits"] for r in feasible],
-                       [r["predicted_dloss"] for r in feasible])
-        knee = feasible[kidx]
-        print(f"[alloc] suggested knee: target={knee['target_bits']}, "
+    if knee_summary.get("enabled"):
+        knee = knee_summary["log_error"]
+        raw = knee_summary["raw_linear"]
+        print(f"[alloc] suggested knee (log-error): "
+              f"target={knee['target_bits']}, "
               f"achieved={knee['achieved_bits']:.3f}, "
-              f"Δloss={knee['predicted_dloss']:.3e}")
+              f"Δloss={knee['kneedle_dloss']:.3e} "
+              f"({knee['kneedle_error_source']})")
+        print(f"[alloc] raw-linear knee: target={raw['target_bits']}, "
+              f"achieved={raw['achieved_bits']:.3f}, "
+              f"Δloss={raw['kneedle_dloss']:.3e} "
+              f"({raw['kneedle_error_source']})")
 
     # Print table
-    print("\n  target  achieved     Δloss (pred)   " + "   ".join(
+    print(f"\n  target  achieved     {'Δloss body':>20}   " + "   ".join(
         f"{s.name[:11]:>11}" for s in specs_sorted))
     for row in curve:
         if not row.get("feasible"):
@@ -815,11 +1495,12 @@ def main():
             continue
         fmt_str = "   ".join(
             f"{row.get(f'layers_{s.name}', 0):>11,}" for s in specs_sorted)
+        dloss_str = f"{row['predicted_dloss']:.4e}"
         print(f"  {row['target_bits']:>6.3f}  {row['achieved_bits']:>7.3f}  "
-              f"{row['predicted_dloss']:>14.4e}   {fmt_str}")
+              f"{dloss_str:>20}   {fmt_str}")
 
     # Emit chosen layer_config for target_bits.
-    assignment, achieved, total = _solve_for_target(args.target_bits)
+    assignment, achieved, total, mutable_total = _solve_for_target(args.target_bits)
     if assignment is None:
         raise SystemExit(
             f"Infeasible at target_bits={args.target_bits}. "
@@ -837,31 +1518,21 @@ def main():
         assignment_expanded = expand_fused_sibling_assignment(
             assignment_expanded, stats)
 
-    assignment_expanded.update(forced_passthrough_assignment)
+    assignment_expanded.update(fixed_format_assignment)
 
     # vLLM's FusedMoE requires all projections of the same expert to share
     # one scheme. This keeps per-Linear assignments serveable without
     # collapsing experts into allocator super-items.
-    assignment_expanded = promote_moe_pair(
+    assignment_expanded = promote_serving_units(
         assignment_expanded,
         format_rank,
         profile=model_profile,
     )
 
-    # Visual-encoder Linear handling. Two paths:
-    #
-    # 1. --visual-sensitivity=fisher (default) + probe/cost have real
-    #    visual entries → visual Linears already participated in the
-    #    knapsack DP above with their own per-Linear Fisher + per-format
-    #    RTN cost. No override needed; just make sure every discoverable
-    #    visual Linear has an assignment entry (fall back to --visual-
-    #    format for any that the probe missed, e.g. patch_embed Linears
-    #    that the probe's regex didn't hit).
-    #
-    # 2. --visual-sensitivity=uniform OR Fisher missing → Phase 1 path:
-    #    scan source checkpoint for visual Linears and stamp them all
-    #    with --visual-format.
-    visual_format = args.visual_format
+    # Visual-encoder Linears are auxiliary to the language-model budget.
+    # Stamp them with --visual-format for export, but keep them out of the
+    # body DP frontier, default bpp, and default Δloss.
+    visual_format = visual_format_canonical
     visual_sensitivity = args.visual_sensitivity
 
     def _visual_fisher_available(stats_d: dict, costs_d: dict) -> bool:
@@ -871,9 +1542,14 @@ def main():
         any_visual_costs = any(_is_visual_linear(n) for n in costs_d)
         return any_visual_stats and any_visual_costs
 
-    fisher_visual_ok = (visual_sensitivity == "fisher"
-                        and _visual_fisher_available(stats, costs))
-    if visual_sensitivity == "fisher" and not fisher_visual_ok:
+    if visual_sensitivity == "fisher" and visual_names:
+        print(
+            "[alloc] --visual-sensitivity=fisher found visual Linears, "
+            "but visual assignments are auxiliary to the body budget; "
+            f"using --visual-format={visual_format} for the layer_config.",
+            flush=True,
+        )
+    elif visual_sensitivity == "fisher" and not _visual_fisher_available(stats, costs):
         print("[alloc] --visual-sensitivity=fisher requested but probe / "
               "cost pickles have no visual Linear entries; falling back "
               f"to --visual-format={visual_format} (Phase 1 uniform).",
@@ -884,44 +1560,33 @@ def main():
     else:
         visual_names_src = []
 
-    if fisher_visual_ok:
-        # Fisher path: DP already placed visual Linears. Fill in any
-        # discoverable visual Linear that the DP missed (e.g. the probe
-        # regex matched only `visual.blocks.*` but the source has
-        # `visual.merger.*` or `visual.patch_embed.*` too) with the
-        # uniform --visual-format as a safety net.
-        dp_visual_count = sum(1 for n in assignment_expanded
-                              if _is_visual_linear(n))
-        filled = 0
+    if visual_names_src:
         for vname in visual_names_src:
-            if vname not in assignment_expanded:
-                assignment_expanded[vname] = visual_format
-                filled += 1
-        print(f"[alloc] --visual-sensitivity=fisher: DP placed "
-              f"{dp_visual_count} visual Linears via per-Linear Fisher; "
-              f"{filled} additional visual Linears (un-probed) stamped "
-              f"with --visual-format={visual_format}.", flush=True)
-    else:
-        # Uniform path (Phase 1): stamp every discoverable visual Linear.
-        if visual_names_src:
-            for vname in visual_names_src:
-                assignment_expanded[vname] = visual_format
-            print(f"[alloc] --visual-format={visual_format}: assigned "
-                  f"{len(visual_names_src)} visual Linears uniformly "
-                  f"(source={probe_model_path})", flush=True)
-        elif visual_format != "BF16":
-            print(f"[alloc] --visual-format={visual_format}: no visual "
-                  f"Linears found in source checkpoint — override is a "
-                  f"no-op", flush=True)
+            assignment_expanded[vname] = visual_format
+        print(f"[alloc] --visual-format={visual_format}: assigned "
+              f"{len(visual_names_src)} visual Linears uniformly "
+              f"(source={probe_model_path})", flush=True)
+    elif visual_format != "BF16":
+        print(f"[alloc] --visual-format={visual_format}: no visual "
+              f"Linears found in source checkpoint — override is a "
+              f"no-op", flush=True)
 
     mtp_count = sum(1 for n in assignment_expanded if n.startswith("mtp."))
     if mtp_count:
-        assignment_expanded = apply_mtp_format_override(
-            assignment_expanded,
-            args.mtp_format,
-        )
+        mtp_fmts = {
+            assignment_expanded[n]
+            for n in assignment_expanded
+            if n.startswith("mtp.")
+        }
+        expected_mtp_fmts = {mtp_format_canonical}
+        if mtp_fmts != expected_mtp_fmts:
+            raise AssertionError(
+                f"MTP assignment drifted after fixed-format accounting: "
+                f"expected {sorted(expected_mtp_fmts)}, got "
+                f"{sorted(mtp_fmts)}"
+            )
         print(
-            f"[alloc] --mtp-format={args.mtp_format}: assigned "
+            f"[alloc] --mtp-format={mtp_format_canonical}: assigned "
             f"{mtp_count} MTP Linears uniformly",
             flush=True,
         )
@@ -968,7 +1633,7 @@ def main():
             layer_cfg[name] = format_specs[fmt].autoround_config()
         else:
             # Visual format outside the body's format set (e.g., user
-            # passed --formats NVFP4,BF16 plus --visual-format MXFP8).
+            # passed --formats NVFP4,BF16 plus --visual-format MXFP8_E4M3).
             # Resolve from the global registry.
             layer_cfg[name] = fr.get_format(fmt).autoround_config()
 
@@ -978,13 +1643,26 @@ def main():
         json.dump(layer_cfg, f, indent=2)
 
     counts = defaultdict(int)
-    for fmt in assignment.values():
+    for fmt in assignment_expanded.values():
         counts[fmt] += 1
     print(f"\n[alloc] target={args.target_bits} achieved={achieved:.3f}")
     for fmt, n in sorted(counts.items(), key=lambda kv: -kv[1]):
         print(f"  {fmt:>14}: {n:>5} layers")
     print(f"\nLayer config → {out}")
     print(f"Feed to AutoRound via --layer_config {out}")
+
+    # Optional read-only "where did the budget go?" attribution over the final
+    # resolved body assignment. Derived from already-resolved data; no re-probe.
+    _write_bit_attribution_reports(
+        args.bit_attribution_json,
+        args.bit_attribution_csv,
+        target_bits=args.target_bits,
+        achieved_bits=achieved,
+        assignment_expanded=assignment_expanded,
+        candidates=candidates,
+        stats_entry_for=_stats_entry_for_assignment_name,
+        format_specs=format_specs,
+    )
 
 
 if __name__ == "__main__":

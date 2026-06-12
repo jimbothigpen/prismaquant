@@ -1,8 +1,9 @@
 """Build a production-faithful δw cache for a model checkpoint.
 
 Renders W_tilde[name, fmt] using the export pipeline's activation-aware
-passes (GPTQ damp-sweep + scale_sweep on NVFP4; activation-weighted scale
-search on MXFP8/FP8; passthrough on BF16) and saves a pickle that
+passes (GPTQ damp-sweep + scale_sweep on NVFP4; GPTQ damp-sweep on
+FP8_DYNAMIC/FP8_E4M3; explicit MX formats only when requested; passthrough
+on BF16) and saves a pickle that
 PerturbedActivationCache can load via ``production_weight_cache=...``.
 
 By default this standalone CLI renders the explicit ``--formats`` menu for
@@ -62,9 +63,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument(
         "--formats",
         default="NVFP4",
-        help="Comma-separated formats to render. MXFP8 / FP8 / BF16 cache "
-        "is cheap compared with NVFP4, but MXFP8 and FP8 still benefit "
-        "from activation-weighted scale search when scale_sweep is enabled.",
+        help="Comma-separated formats to render. FP8_DYNAMIC is accepted "
+        "as an alias for FP8_E4M3 and uses GPTQ damp-sweep. MXFP8/E5M2 "
+        "are explicit opt-in research/legacy formats.",
     )
     p.add_argument(
         "--render-scope",
@@ -104,18 +105,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     p.add_argument(
         "--enable",
-        default="gptq,joint_scale_opt",
+        default="gptq,static_act_order,joint_scale_opt",
         help="Comma-separated levers to enable. Currently honored: "
-        "{none, gptq, joint_scale_opt}. "
+        "{none, gptq, static_act_order, joint_scale_opt}. "
         "Use none for RTN-only rendering with no local production levers. "
-        "Default `gptq,joint_scale_opt` ships GPTQ (with the always-on "
-        "per-Linear damp sweep) plus JSO. "
+        "Default `gptq,static_act_order,joint_scale_opt` ships GPTQ "
+        "(with the always-on per-Linear damp sweep), static activation "
+        "ordering where the format supports it, plus JSO. FP8_DYNAMIC "
+        "uses GPTQ damp-sweep; static activation ordering and JSO are "
+        "ignored for FP8 because its served representation is per-row "
+        "scaled FP8 dynamic. "
         "scale_sweep regresses end-to-end KL on Qwen3-4B and was dropped "
         "from defaults 2026-05-15. "
-        "static_act_order (SAO) and fisher_gptq are archived legacy names "
-        "and must not be used for V1 production artifacts. "
+        "fisher_gptq is an archived legacy name and must not be used for "
+        "V1 production artifacts. "
         "Joint NVFP4 sibling globals + calibrated input_global_scale are "
         "computed unconditionally when NVFP4 is in the format menu. "
+        "static_act_order applies to production microscaling GPTQ formats "
+        "(NVFP4, MXFP4, MXFP8); joint_scale_opt applies only to NVFP4. "
+        "MXFP4/MXFP8 use the canonical E8M0 scale rule inside GPTQ when "
+        "explicitly requested. "
         "NVFP4 block scaling follows PRISMAQUANT_NVFP4_SCALE_RULE.",
     )
     p.add_argument(
@@ -147,7 +156,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=None,
         help="Optional h-detail directory from incremental_probe. When "
         "'fisher_gptq' is enabled, g2_per_token vectors from this directory "
-        "weight NVFP4 GPTQ/scale-sweep and MXFP8 scale-sweep objectives.",
+        "weight NVFP4 GPTQ/scale-sweep and explicit microscaled-FP8 "
+        "objectives.",
     )
     p.add_argument(
         "--skip-qnames",
@@ -157,6 +167,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         "the cache fill. Default: the active model profile's pinned_names "
         "(typically lm_head/head). Pass --skip-qnames with no values to "
         "disable this skip.",
+    )
+    p.add_argument(
+        "--include-qnames-file",
+        default=None,
+        help="Optional newline-delimited qname allowlist. After normal "
+        "profile/pinned skips, only qnames in this file are rendered. Used "
+        "by staged production-render cost to render FP8_DYNAMIC only for "
+        "the high-error NVFP4 tail.",
     )
     p.add_argument(
         "--recache-layer-config",
@@ -293,6 +311,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"[build-prod-cache] skipped {len(skipped)} qnames matching "
                 f"{skip_tokens} (typically pinned-BF16 in polish): "
                 f"{skipped if len(skipped) <= 5 else skipped[:5] + ['...']}",
+                flush=True,
+            )
+        if args.include_qnames_file:
+            include_path = Path(args.include_qnames_file)
+            allowed = {
+                line.strip()
+                for line in include_path.read_text().splitlines()
+                if line.strip() and not line.lstrip().startswith("#")
+            }
+            before = len(qnames)
+            qnames = [q for q in qnames if q in allowed]
+            print(
+                f"[build-prod-cache] include-qnames-file={include_path} "
+                f"kept {len(qnames)}/{before} qnames",
                 flush=True,
             )
 

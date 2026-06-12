@@ -26,6 +26,17 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 import torch
+from compressed_tensors.quantization.utils.mxfp_utils import generate_mx_scales
+
+from prismaquant.fp8_dynamic import (
+    fp8_dynamic_activation_qdq_vllm,
+    fp8_dynamic_weight_qdq,
+)
+from prismaquant.mx_formats import (
+    e8m0_to_scale,
+    mxfp8_e4m3_activation_qdq_vllm,
+    mxfp8_e4m3_weight_qdq,
+)
 
 
 @dataclass
@@ -122,6 +133,11 @@ FORMAT_ALIASES: dict[str, str] = {
     # Keep it accepted at every input boundary, but normalize persisted solver
     # and measurement output to the explicit FP8 variant.
     "MXFP8": "MXFP8_E4M3",
+    # User-facing production alias for vLLM FP8 dynamic quantization:
+    # per-output-row FP32 weight scales and per-token dynamic activation
+    # scales, serialized as compressed-tensors float-quantized FP8_E4M3.
+    "FP8": "FP8_E4M3",
+    "FP8_DYNAMIC": "FP8_E4M3",
 }
 
 
@@ -131,7 +147,17 @@ def register_format(spec: FormatSpec) -> FormatSpec:
 
 
 def canonical_format_name(name: str) -> str:
-    return FORMAT_ALIASES.get(name, name)
+    raw = str(name).strip()
+    if raw in FORMAT_ALIASES:
+        return FORMAT_ALIASES[raw]
+    if raw in REGISTRY:
+        return raw
+    upper = raw.upper()
+    if upper in FORMAT_ALIASES:
+        return FORMAT_ALIASES[upper]
+    if upper in REGISTRY:
+        return upper
+    return raw
 
 
 def aliases_for(name: str) -> tuple[str, ...]:
@@ -174,27 +200,52 @@ def _rtn_uniform_int(w: torch.Tensor, bits: int, group_size: int,
     return w_rec.reshape(orig_shape).to(w.dtype)
 
 
-def _snap_scale_e8m0(scale: torch.Tensor) -> torch.Tensor:
-    """Snap a real-valued per-group scale to the nearest power of two.
+def _mx_rounded_amax_power2(amax: torch.Tensor) -> torch.Tensor:
+    """Round a block amax to the MX scale power-of-two grid."""
+    x = amax.to(torch.float32).clamp_min(torch.finfo(torch.float32).tiny)
+    raw = x.view(torch.int32).to(torch.int64)
+    val_to_add = 1 << (23 - 1 - 1)
+    sign_exponent_mask = ((1 << (8 + 1)) - 1) << 23
+    rounded = torch.bitwise_and(raw + val_to_add, sign_exponent_mask)
+    return rounded.to(torch.int32).view(torch.float32)
+
+
+def _snap_scale_e8m0(
+    scale: torch.Tensor,
+    *,
+    element_max: torch.Tensor,
+    num_bits: int | None = None,
+) -> torch.Tensor:
+    """Snap a real-valued per-group scale to the served MX E8M0 grid.
 
     The OCP MX spec encodes the per-block scale as an 8-bit E8M0 value:
     unsigned, exponent-only, range 2^(-127) to 2^127. Representable
-    values are exactly the powers of two. Using a real-valued scale
-    (the previous behavior) under-estimates RTN error because the actual
-    serving path will round-trip through the E8M0 grid, introducing
-    extra error proportional to the scale's distance from a power of
-    two.
+    values are exactly powers of two. compressed-tensors derives MXFP4/MXFP8
+    weight scales by rounding the block amax to a power of two, then
+    subtracting the element-format exponent offset.
 
     For NV (non-MX) formats, scales are FP8 and effectively continuous;
     no snapping is applied.
     """
-    log2_s = torch.log2(scale.clamp_min(2.0 ** -127))
-    snapped_exp = torch.round(log2_s).clamp(-127.0, 127.0)
+    element_max_f = element_max.to(device=scale.device, dtype=torch.float32)
+    amax = scale.to(torch.float32) * element_max_f
+    if num_bits in {4, 8}:
+        e8m0 = generate_mx_scales(amax, num_bits=num_bits).to(torch.uint8)
+        return e8m0_to_scale(e8m0, device=scale.device)
+
+    # compressed-tensors only defines MX scale generation for FP4 E2M1 and
+    # FP8 E4M3. Keep the local fallback for research-only FP6/E5M2 variants.
+    rounded = _mx_rounded_amax_power2(amax)
+    element_offset = torch.floor(torch.log2(element_max_f))
+    snapped_exp = (
+        torch.floor(torch.log2(rounded)) - element_offset
+    ).clamp(-127.0, 127.0)
     return torch.pow(2.0, snapped_exp)
 
 
 def _rtn_fp_codebook(w: torch.Tensor, codebook: torch.Tensor,
-                     group_size: int, mx_scale: bool = False) -> torch.Tensor:
+                     group_size: int, mx_scale: bool = False,
+                     mx_num_bits: int | None = None) -> torch.Tensor:
     """Round to nearest value in a small FP codebook, with per-group scaling.
 
     Vectorized via torch.bucketize on the sorted codebook. For each scaled
@@ -223,7 +274,11 @@ def _rtn_fp_codebook(w: torch.Tensor, codebook: torch.Tensor,
     max_abs = w2.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
     scale = max_abs / cmax
     if mx_scale:
-        scale = _snap_scale_e8m0(scale)
+        scale = _snap_scale_e8m0(
+            scale,
+            element_max=cmax,
+            num_bits=mx_num_bits,
+        )
     x = w2 / scale                                    # shape (..., group)
 
     # Bucketize returns the insertion index: cb[idx-1] <= x < cb[idx].
@@ -363,6 +418,7 @@ def _make_rtn(codebook_name: str, group_size: int, mx_scale: bool = False):
     argument to the compiled inner.
     """
     cb_cpu = _CODEBOOKS[codebook_name]
+    mx_num_bits = {"fp4_e2m1": 4, "fp8_e4m3": 8}.get(codebook_name)
 
     # Inner function takes a pre-resolved on-device codebook so the
     # compile can trace cleanly.  Functionally equivalent to
@@ -382,7 +438,11 @@ def _make_rtn(codebook_name: str, group_size: int, mx_scale: bool = False):
         max_abs = w2.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
         scale = max_abs / cmax
         if mx_scale:
-            scale = _snap_scale_e8m0(scale)
+            scale = _snap_scale_e8m0(
+                scale,
+                element_max=cmax,
+                num_bits=mx_num_bits,
+            )
         x = w2 / scale
         idx = torch.bucketize(x.contiguous(), cb)
         idx_lo = (idx - 1).clamp_min(0)
@@ -395,7 +455,15 @@ def _make_rtn(codebook_name: str, group_size: int, mx_scale: bool = False):
         return w_rec.reshape(orig_shape).to(w.dtype)
 
     import os as _os
-    if _os.environ.get(
+    if group_size == 0:
+        # The compiled closure captures group_size.  On torch 2.9/NVIDIA
+        # 25.10, compiling grouped RTN first (for NV/MX) and then compiling
+        # this per-token/plain-FP8 variant can make Dynamo reuse the wrong
+        # specialization and raise division-by-zero inside Inductor.  Keep
+        # plain FP8 eager so activation-aware render scores cannot silently
+        # degrade to raw weight/output MSE.
+        _inner = _inner_eager
+    elif _os.environ.get(
         "PRISMAQUANT_DISABLE_RTN_COMPILE", "",
     ).strip().lower() in {"1", "true", "yes", "on"}:
         _inner = _inner_eager
@@ -424,6 +492,47 @@ def _make_rtn(codebook_name: str, group_size: int, mx_scale: bool = False):
             cb_cpu, device=w.device, dtype=torch.float32,
         )
         return _inner(w, cb)
+
+    return f
+
+
+def _mxfp8_e4m3_activation_vllm_rtn(x: torch.Tensor) -> torch.Tensor:
+    """Match vLLM/compressed-tensors dynamic MXFP8 activation quantization."""
+    return mxfp8_e4m3_activation_qdq_vllm(x).dequant.to(x.dtype)
+
+
+def _mxfp8_e4m3_weight_rtn(w: torch.Tensor) -> torch.Tensor:
+    """Renderer-side MXFP8_E4M3 weight RTN matching exported metadata."""
+    return mxfp8_e4m3_weight_qdq(w).dequant.to(w.dtype)
+
+
+def _make_plain_fp8_weight_rtn(
+    element_dtype: torch.dtype,
+    element_max: float,
+):
+    """Plain FP8 per-output-channel weight QDQ."""
+    def f(w: torch.Tensor) -> torch.Tensor:
+        return fp8_dynamic_weight_qdq(
+            w,
+            element_dtype=element_dtype,
+            element_max=element_max,
+        ).dequant.to(w.dtype)
+
+    return f
+
+
+def _make_plain_fp8_activation_vllm_rtn(
+    element_dtype: torch.dtype,
+    element_max: float,
+):
+    """vLLM dynamic per-token FP8 activation QDQ."""
+
+    def f(x: torch.Tensor) -> torch.Tensor:
+        return fp8_dynamic_activation_qdq_vllm(
+            x,
+            element_dtype=element_dtype,
+            element_max=element_max,
+        ).dequant.to(x.dtype)
 
     return f
 
@@ -495,7 +604,8 @@ register_format(FormatSpec(
     activation_quantize_dequantize=lambda x: x,
 ))
 
-# MXFP4 / MXFP8 / MXFP6 variants  (OCP MX, group_size=32, E8M0 scales)
+# MXFP4 / MXFP8_E4M3 / MXFP8_E5M2 / MXFP6 variants
+# (OCP MX, group_size=32, E8M0 scales)
 # All MX formats use mx_scale=True so RTN models the actual E8M0 power-of-two
 # per-block scale used by the serving path. Without this the measured RTN
 # error would be slightly optimistic vs what the kernel actually produces.
@@ -527,22 +637,13 @@ register_format(FormatSpec(
     activation_quantize_dequantize=_make_rtn("fp6_e2m3", 32, mx_scale=True),
 ))
 register_format(FormatSpec(
-    name="MXFP8",  # alias for MXFP8_E4M3 (OCP MX canonical default)
-    weight_bits=8, group_size=32, scale_bits=8, scale_dtype_name="uint8_e8m0",
-    weight_element_dtype="fp8_e4m3", act_bits=8, act_dtype_name="fp8_e4m3",
-    act_group_size=32, family="mx", min_capability_sm=100,
-    autoround_config=lambda: _mx_autoround(8, 32, 8, "fp8_e4m3"),
-    quantize_dequantize=_make_rtn("fp8_e4m3", 32, mx_scale=True),
-    activation_quantize_dequantize=_make_rtn("fp8_e4m3", 32, mx_scale=True),
-))
-register_format(FormatSpec(
     name="MXFP8_E4M3",  # explicit name for the canonical variant
     weight_bits=8, group_size=32, scale_bits=8, scale_dtype_name="uint8_e8m0",
     weight_element_dtype="fp8_e4m3", act_bits=8, act_dtype_name="fp8_e4m3",
     act_group_size=32, family="mx", min_capability_sm=100,
     autoround_config=lambda: _mx_autoround(8, 32, 8, "fp8_e4m3"),
-    quantize_dequantize=_make_rtn("fp8_e4m3", 32, mx_scale=True),
-    activation_quantize_dequantize=_make_rtn("fp8_e4m3", 32, mx_scale=True),
+    quantize_dequantize=_mxfp8_e4m3_weight_rtn,
+    activation_quantize_dequantize=_mxfp8_e4m3_activation_vllm_rtn,
 ))
 register_format(FormatSpec(
     name="MXFP8_E5M2",  # wider dynamic range, less mantissa precision
@@ -559,20 +660,24 @@ register_format(FormatSpec(
     weight_element_dtype="fp8_e4m3", act_bits=None,
     family="mx", min_capability_sm=80,  # W8A16 works on Marlin
     autoround_config=lambda: _mx_autoround(8, 32, 16, "fp8_e4m3"),
-    quantize_dequantize=_make_rtn("fp8_e4m3", 32, mx_scale=True),
+    quantize_dequantize=_mxfp8_e4m3_weight_rtn,
     activation_quantize_dequantize=lambda x: x,
 ))
 
-# Plain FP8 (per-tensor scale on weights, no microscaling).  vLLM-native
-# serving path; works on Hopper (sm_90) and Blackwell (sm_100+).
+# Plain FP8 (per-output-channel FP32 scale on weights, no microscaling).
+# vLLM-native serving path; works on Hopper (sm_90) and Blackwell (sm_100+).
 register_format(FormatSpec(
     name="FP8_E4M3",
     weight_bits=8, group_size=0, scale_bits=32, scale_dtype_name="fp32",
     weight_element_dtype="fp8_e4m3", act_bits=8, act_dtype_name="fp8_e4m3",
     act_group_size=0, family="fp", min_capability_sm=90,
     autoround_config=lambda: _plain_fp8_autoround("fp8_e4m3", 8),
-    quantize_dequantize=_make_rtn("fp8_e4m3", 0),
-    activation_quantize_dequantize=_make_rtn("fp8_e4m3", 0),
+    quantize_dequantize=_make_plain_fp8_weight_rtn(
+        torch.float8_e4m3fn, 448.0,
+    ),
+    activation_quantize_dequantize=_make_plain_fp8_activation_vllm_rtn(
+        torch.float8_e4m3fn, 448.0,
+    ),
 ))
 register_format(FormatSpec(
     name="FP8_E5M2",
@@ -580,8 +685,12 @@ register_format(FormatSpec(
     weight_element_dtype="fp8_e5m2", act_bits=8, act_dtype_name="fp8_e5m2",
     act_group_size=0, family="fp", min_capability_sm=90,
     autoround_config=lambda: _plain_fp8_autoround("fp8_e5m2", 8),
-    quantize_dequantize=_make_rtn("fp8_e5m2", 0),
-    activation_quantize_dequantize=_make_rtn("fp8_e5m2", 0),
+    quantize_dequantize=_make_plain_fp8_weight_rtn(
+        torch.float8_e5m2, 57344.0,
+    ),
+    activation_quantize_dequantize=_make_plain_fp8_activation_vllm_rtn(
+        torch.float8_e5m2, 57344.0,
+    ),
 ))
 
 # INT8 per-channel / INT4 per-group
@@ -630,8 +739,8 @@ register_format(FormatSpec(
 # back the SAME BF16 view. Cost is zero Δloss, as it should be.
 #
 # effective_bits = 8 + 32 / (128*128) ≈ 8.002 bpp (scale_inv is fp32
-# at the 128×128 block granularity MiniMax ships; smaller than MXFP8's
-# 8.25 because the block is 128×128 not group-of-32).
+# at the 128×128 block granularity MiniMax ships; smaller than
+# MXFP8_E4M3's 8.25 because the block is 128×128 not group-of-32).
 register_format(FormatSpec(
     name="FP8_SOURCE",
     weight_bits=8, group_size=128, scale_bits=32, scale_dtype_name="fp32",

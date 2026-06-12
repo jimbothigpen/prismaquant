@@ -62,6 +62,7 @@ import torch.nn.functional as F
 from .layer_streaming import (
     _call_layer,
     _compute_position_embeddings,
+    _get_final_norm,
     _make_causal_mask,
 )
 from .sensitivity_probe import (
@@ -102,13 +103,15 @@ from .streaming_model import (
 # ---------------------------------------------------------------------------
 
 
-def _is_minimax_m2_experts_module(module: nn.Module) -> bool:
+def _is_minimax_m2_experts_module(
+    module: nn.Module, proj_names: tuple[str, ...] = ("w1", "w2", "w3")
+) -> bool:
     return (
         type(module).__name__ == "MiniMaxM2Experts"
         and hasattr(module, "num_experts")
         and hasattr(module, "top_k")
         and len(module) > 0
-        and all(hasattr(module[0], n) for n in ("w1", "w2", "w3", "act_fn"))
+        and all(hasattr(module[0], n) for n in (*proj_names, "act_fn"))
     )
 
 
@@ -275,16 +278,19 @@ def _set_minimax_fast_moe(
     enabled: bool,
     *,
     chunk_size: int = 32,
+    proj_names: tuple[str, ...] = ("w1", "w2", "w3"),
 ) -> int:
     """Enable/disable chunked batched MiniMax-M2 expert replay on a layer.
 
     Returns the number of MiniMax expert containers patched under `layer`.
     The patch is instance-local and falls back to the original forward
-    whenever `_pq_fast_moe_enabled` is False.
+    whenever `_pq_fast_moe_enabled` is False. ``proj_names`` are the per-expert
+    projection attribute names (from the model profile; default Qwen/MiniMax
+    ``('w1','w2','w3')``).
     """
     patched = 0
     for module in layer.modules():
-        if not _is_minimax_m2_experts_module(module):
+        if not _is_minimax_m2_experts_module(module, proj_names):
             continue
         if not hasattr(module, "_pq_original_forward"):
             module._pq_original_forward = module.forward
@@ -1082,44 +1088,20 @@ class GlobalPrecompute:
     router_totals: dict[str, int]
     router_active_counts: dict[str, dict[str, int]]
     expert_route_stats: dict[str, dict]
+    # Per-pass shared forward state (e.g. Gemma4 shared_kv_states): captured at
+    # the end of phase-1's sequential forward, reused in phase-3's isolated
+    # per-layer forwards so KV-sharing layers see their borrowed K/V.
+    shared_pass_state: dict | None = None
     # Reusable forward-state derivable from ids + model; recomputed on demand.
 
 
-# === multi-layer-type rope per-layer position_embeddings ===
-
-
-def _resolve_layer_types(base_model):
-    """Return a list of layer_type strings (one per decoder layer), or None.
-    Used by the multi-layer-type rope path (Gemma-4 iSWA, etc.)."""
-    cfg = getattr(base_model, "config", None)
-    if cfg is None:
-        return None
-    lt = getattr(cfg, "layer_types", None)
-    if lt:
-        return list(lt)
-    tc = getattr(cfg, "text_config", None)
-    if tc is not None:
-        lt = getattr(tc, "layer_types", None)
-        if lt:
-            return list(lt)
-    return None
-
-
-def _compute_position_embeddings_for_layer(base_model, hidden, position_ids,
-                                           layer_type, _rotary_cache=None):
-    """Per-layer position_embeddings for multi-layer-type rope. Falls back
-    to the layer-type-agnostic call if the rotary doesn't accept layer_type
-    or if the type isn't registered."""
-    from .layer_streaming import _get_rotary
-    rotary = _get_rotary(base_model)
-    if rotary is None:
-        return None
-    import torch as _torch
-    with _torch.no_grad():
-        try:
-            return rotary(hidden, position_ids, layer_type=layer_type)
-        except TypeError:
-            return rotary(hidden, position_ids)
+# NOTE (sync 2026-06-12): the fork's _resolve_layer_types /
+# _compute_position_embeddings_for_layer helpers (d6b2289) were dropped here.
+# Upstream #10 moved multi-layer-type rope to the canonical path in
+# layer_streaming: _compute_position_embeddings(...) returns a
+# {layer_type: (cos, sin)} dict and _call_layer selects this layer's entry by
+# its attention layer_type. The probe loops below pass that dict straight
+# through, so the fork's parallel per-layer override is now redundant.
 
 
 def _compute_global_precompute(
@@ -1182,6 +1164,11 @@ def _compute_global_precompute(
 
     hidden = _profile.expand_hidden_for_layers(hidden, base_model)
 
+    # Per-pass shared forward state (e.g. Gemma4 cross-layer KV sharing),
+    # threaded into every layer call in the sequential loop below and
+    # captured afterward for phase-3's isolated forwards.
+    pass_state = _profile.new_forward_pass_state()
+
     print(f"[incremental/global] phase-1 N={batch_size} T={tokens_in_sample} "
           f"hidden={tuple(hidden.shape)}", flush=True)
 
@@ -1193,7 +1180,6 @@ def _compute_global_precompute(
     # call. The pickled precompute cache (and downstream phase-3) want
     # CPU tensors, which we produce after the loop.
     device_acts: list[torch.Tensor] = [hidden.detach()]
-    _layer_types_list = _resolve_layer_types(base_model)
     for L in range(num_layers):
         load_t0 = time.time()
         src = ctx.install(L)
@@ -1204,17 +1190,17 @@ def _compute_global_precompute(
                 layers[L], True, chunk_size=minimax_fast_moe_chunk_size)
         fwd_t0 = time.time()
         with torch.no_grad():
-            _layer_pe = position_embeddings
-            if _layer_types_list is not None and L < len(_layer_types_list):
-                _layer_pe = _compute_position_embeddings_for_layer(
-                    base_model, hidden, position_ids, _layer_types_list[L])
             out = _call_layer(
                 layers[L], hidden,
-                position_embeddings=_layer_pe,
+                position_embeddings=position_embeddings,
                 attention_mask=causal_mask,
                 position_ids=position_ids,
+                # sync 2026-06-12: fork's per_layer_input kwargs
+                # (base_model/layer_idx, 49f4673) threaded alongside upstream's
+                # KV-sharing pass_state (9f4a86b) — distinct Gemma-4 concerns.
                 **_profile.extra_layer_kwargs(
                     input_ids=ids, base_model=base_model, layer_idx=L),
+                **pass_state,
             )
         fwd_s = time.time() - fwd_t0
         hidden = out
@@ -1223,6 +1209,12 @@ def _compute_global_precompute(
         if L % 8 == 0 or L == num_layers - 1:
             print(f"[incremental/global] fwd L{L:02d}  src={src}  "
                   f"load={load_s:.2f}s  fwd={fwd_s:.2f}s", flush=True)
+    # Snapshot the cross-layer shared state (e.g. Gemma4 shared_kv_states)
+    # now that the full sequential forward is done — it holds the K/V the
+    # KV-sharing layers reuse. Captured to CPU for the pickled precompute so
+    # phase-3's isolated forwards can reconstruct it.
+    shared_pass_state = _profile.capture_forward_pass_state(pass_state)
+
     # v22 Fix E1: batched device→host transfer for the activations
     # captured during phase-1. All have the same (B, T, H) shape so we
     # stack into one (L+1, B, T, H) tensor and do a single .cpu() —
@@ -1366,7 +1358,7 @@ def _compute_global_precompute(
     # fold multi-stream `[B, T, hc_mult, H]` back to `[B, T, H]`.
     final_hidden_for_norm = _profile.collapse_hidden_after_layers(
         final_hidden, base_model)
-    norm_out = base_model.norm(final_hidden_for_norm)
+    norm_out = _get_final_norm(base_model)(final_hidden_for_norm)
     norm_out_d = norm_out.detach().requires_grad_(True)
     grad_buf = torch.zeros_like(norm_out_d)
     chunk_T = 256
@@ -1440,6 +1432,7 @@ def _compute_global_precompute(
         router_totals=phase1_router_totals,
         router_active_counts=phase1_router_active_counts,
         expert_route_stats=phase1_expert_route_stats,
+        shared_pass_state=shared_pass_state,
     )
 
 
@@ -1821,6 +1814,13 @@ def _run_body_streaming_shard(
             moe_linear_to_block: dict[str, tuple[str, int, str]] = {}
             moe_block_pending: dict[str, dict[tuple[int, str], tuple]] = {}
             moe_block_handles: list = []
+            # Per-expert projection attribute names from the model profile so
+            # unpacked-expert families that don't use w1/w2/w3 still get the
+            # batched-Fisher block path instead of silently falling back to the
+            # (correct but slower) per-Linear hooks. Default keeps Qwen behavior.
+            _moe_proj = getattr(
+                _shard_profile, "unpacked_expert_projection_names", None)
+            moe_w_attrs = tuple(_moe_proj()) if callable(_moe_proj) else ("w1", "w2", "w3")
             for block_name, block in layers[L].named_modules():
                 full_block_name = f"{layers_prefix}{L}.{block_name}" if block_name else f"{layers_prefix}{L}"
                 children = list(block.named_children())
@@ -1828,7 +1828,7 @@ def _run_body_streaming_shard(
                     continue
                 ok = True
                 for _, child in children:
-                    for w in ("w1", "w2", "w3"):
+                    for w in moe_w_attrs:
                         if not isinstance(getattr(child, w, None), nn.Linear):
                             ok = False
                             break
@@ -1843,7 +1843,7 @@ def _run_body_streaming_shard(
                         eid = int(cname)
                     except ValueError:
                         ok = False; break
-                    for w in ("w1", "w2", "w3"):
+                    for w in moe_w_attrs:
                         ln = f"{full_block_name}.{cname}.{w}"
                         if ln in tracked_set:
                             moe_linear_to_block[ln] = (full_block_name, eid, w)
@@ -2162,10 +2162,13 @@ def _run_body_streaming_shard(
             # original ModuleList expert loop so per-expert nn.Linear
             # hooks collect Fisher exactly as before.
             if minimax_fast_moe:
+                _mmx_proj = getattr(
+                    _shard_profile, "unpacked_expert_projection_names", None)
                 _set_minimax_fast_moe(
                     layers[L],
                     enabled=not layer_in_scope,
                     chunk_size=minimax_fast_moe_chunk_size,
+                    proj_names=tuple(_mmx_proj()) if callable(_mmx_proj) else ("w1", "w2", "w3"),
                 )
             packed_meta = install_packed_expert_hooks(
                 layers[L], accumulator=packed_grad_acc,
@@ -2211,19 +2214,21 @@ def _run_body_streaming_shard(
             # Forward + backward for this layer with the full batch.
             x_in = activations_cpu[L].to(device).to(dtype).detach().requires_grad_(True)
             bwd_t0 = time.time()
-            _shard_layer_types = _resolve_layer_types(base_model)
-            _layer_pe = position_embeddings
-            if _shard_layer_types is not None and L < len(_shard_layer_types):
-                _layer_pe = _compute_position_embeddings_for_layer(
-                    base_model, x_in, position_ids, _shard_layer_types[L])
             out = _call_layer(
                 layers[L], x_in,
-                position_embeddings=_layer_pe,
+                position_embeddings=position_embeddings,
                 attention_mask=causal_mask,
                 position_ids=position_ids,
+                # sync 2026-06-12: fork's per_layer_input kwargs
+                # (base_model/layer_idx, 49f4673) threaded alongside upstream's
+                # isolated KV-sharing pass_state (9f4a86b).
                 **_shard_profile.extra_layer_kwargs(
                     input_ids=calib.to(device) if calib is not None else None,
                     base_model=base_model, layer_idx=L),
+                # KV-sharing layers (Gemma4) reuse K/V captured in phase-1;
+                # reconstruct that per-layer slice for this isolated forward.
+                **_shard_profile.isolated_layer_pass_state(
+                    precomputed.shared_pass_state, layers[L]),
             )
             out.backward(grad_out.to(device))
             bwd_s = time.time() - bwd_t0
@@ -2597,7 +2602,7 @@ def _run_mtp_streaming_shard(
     inputs_embeds_cpu = precomputed.activations_cpu[0]
     with torch.no_grad():
         pre_norm = precomputed.activations_cpu[-1].to(device).to(dtype)
-        body_final_cpu = base_model.norm(pre_norm).detach().cpu()
+        body_final_cpu = _get_final_norm(base_model)(pre_norm).detach().cpu()
         del pre_norm
     print(f"[incremental/mtp] body forward reused from global precompute "
           f"(norm only: {time.time()-t_phase:.1f}s)", flush=True)
@@ -2659,7 +2664,9 @@ def _run_mtp_streaming_shard(
                if isinstance(m, nn.Linear) and not re.search(r"mlp\.gate$", n)]
     print(f"[incremental/mtp] tracking {len(tracked)} MTP Linears", flush=True)
 
-    expert_info_all = discover_moe_structure(mtp_wrapper, profile=profile)
+    from .model_profiles import profile_from_model as _profile_from_model
+    mtp_profile = _profile_from_model(model)
+    expert_info_all = discover_moe_structure(mtp_wrapper, profile=mtp_profile)
     expert_info = {k: v for k, v in expert_info_all.items() if k in tracked}
     top_k = read_top_k(mtp_wrapper, default=2)
 
@@ -2801,6 +2808,12 @@ def main():
                          "each chunk consumed. Pass a positive integer to "
                          "truncate to the first N samples (smoke tests).")
     ap.add_argument("--seqlen", type=int, default=256)
+    ap.add_argument("--calib-seed", type=int, default=42,
+                    help="Seed for calibration text-subset shuffle and "
+                         "within-text window start position. Different seeds "
+                         "give different sample subsets from the same dataset, "
+                         "useful for multi-probe robust-Fisher experiments. "
+                         "Default 42 reproduces historical behavior.")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--device-map", default=None)
     ap.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
@@ -3078,7 +3091,8 @@ def main():
                     ns = 4  # legacy fallback for non-jsonl datasets
             args.nsamples = ns  # write back so meta records the actual count
             calib = load_calibration(
-                tokenizer, args.dataset, ns, args.seqlen)
+                tokenizer, args.dataset, ns, args.seqlen,
+                calib_seed=int(args.calib_seed))
             print(f"[incremental] calibration ready: {tuple(calib.shape)}",
                   flush=True)
 
@@ -3468,22 +3482,46 @@ def main():
             h_detail_dir=args.h_detail_dir,
         )
         if not ok:
-            print("[incremental] streaming multimodal probe failed; "
-                  "trying monolithic whole-model fallback (fits only when "
-                  "total model weights < RAM)", flush=True)
-            ok = run_multimodal_visual_probe_pass(
-                args.model,
-                dataset_name=args.mm_dataset,
-                n_samples=args.mm_nsamples,
-                max_text_len=args.mm_max_text_len,
-                requested_device=args.device,
-                dtype=mm_dtype,
-                linear_include=visual_include,
-                linear_exclude=linear_exclude,
-                activation_cache_dir=args.activation_cache_dir,
-                output_path=str(visual_probe_path),
-                h_detail_dir=args.h_detail_dir,
-            )
+            idx_path = Path(args.model) / "model.safetensors.index.json"
+            total_size = 0
+            if idx_path.exists():
+                try:
+                    with idx_path.open() as f:
+                        total_size = int(
+                            json.load(f).get("metadata", {}).get("total_size", 0)
+                        )
+                except Exception:
+                    total_size = 0
+            try:
+                import psutil
+                avail_bytes = int(psutil.virtual_memory().available)
+            except Exception:
+                avail_bytes = 0
+            # The fallback loads the full multimodal model. On 122B-scale
+            # checkpoints that is an OOM path, not a recovery path.
+            if total_size and avail_bytes and total_size > int(avail_bytes * 0.75):
+                print("[incremental] streaming multimodal probe failed; "
+                      "skipping monolithic whole-model fallback because "
+                      f"checkpoint total_size={total_size / (1024 ** 3):.1f} GiB "
+                      f"exceeds 75% of available RAM="
+                      f"{avail_bytes / (1024 ** 3):.1f} GiB", flush=True)
+            else:
+                print("[incremental] streaming multimodal probe failed; "
+                      "trying monolithic whole-model fallback (fits only when "
+                      "total model weights < RAM)", flush=True)
+                ok = run_multimodal_visual_probe_pass(
+                    args.model,
+                    dataset_name=args.mm_dataset,
+                    n_samples=args.mm_nsamples,
+                    max_text_len=args.mm_max_text_len,
+                    requested_device=args.device,
+                    dtype=mm_dtype,
+                    linear_include=visual_include,
+                    linear_exclude=linear_exclude,
+                    activation_cache_dir=args.activation_cache_dir,
+                    output_path=str(visual_probe_path),
+                    h_detail_dir=args.h_detail_dir,
+                )
         if not ok:
             print("[incremental] multimodal visual probe skipped / failed; "
                   "allocator will need --visual-format for visual Linears",
