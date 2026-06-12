@@ -46,19 +46,23 @@ not specific to gemma-4 or NemotronH:
 | `embed_tokens` / `embeddings` dual lookup | `incremental_probe.py` | mirror of the above for the runtime forward call site |
 | Defensive `.get()` on `autoscale_diag` | `streaming_model.py` | older diag dict shape lacks some keys; one-off KeyError → silent default |
 | Multi-layer-type rope fallback | `streaming_model.py` | when `cfg.rope_parameters` is a dict-of-dicts (DSv4, Gemma3, Gemma-4), `rope_init_fn(cfg, device)` raises KeyError(None); fall back to per-type buffer registration |
-| Per-layer `position_embeddings` for multi-layer-type rope | `incremental_probe.py` | recompute cos/sin per layer when layers have different rope_theta or partial_rotary_factor |
 | Orphan-tensor skip in `_fast_install` | `layer_streaming.py` | Gemma-4 saves K-norm/V-norm/etc. weights for kv-shared layers but `Gemma4TextAttention` doesn't allocate the attrs; `transformers.from_pretrained` ignores silently — we mirror that |
 
 ### Architecture-specific (Gemma-4 streaming-probe profile)
 
 The existing `Gemma4Profile` in upstream covered only vLLM allocator
-metadata (MoE expert regex, multimodal tower passthrough). To run the
-streaming probe path on Gemma-4, the profile needs to override
-`init_rotaries`, `extra_layer_kwargs`, and inject synthetic K/V
-tensors for kv-shared layers. See
+metadata (MoE expert regex, multimodal tower passthrough). As of the
+2026-06-12 upstream sync, upstream also provides the canonical
+multi-layer-type `init_rotaries` (re-runs the rotary's own `__init__`
+on-device, Fix #6); the fork no longer hand-rolls that method and
+instead **grafts** its scaffolding cache-population onto upstream's
+`init_rotaries` — the nine structural `Gemma4Profile` caches that
+`extra_layer_kwargs` consumes to supply `per_layer_input` and synthesize
+zero-K/V for kv-shared layers. The profile still overrides
+`extra_layer_kwargs` and injects synthetic K/V tensors for kv-shared
+layers. See
 [`docs/gemma4-profile.md`](https://github.com/jimbothigpen/prismaquant-llama/blob/main/docs/gemma4-profile.md)
-in the prismaquant-llama repo for the detailed breakdown of all seven
-patches and tradeoffs.
+in the prismaquant-llama repo for the detailed breakdown and tradeoffs.
 
 ### Architecture-specific (Gemma 3 profile)
 
@@ -86,6 +90,24 @@ the fork's footprint over time.
 If you need the unpatched upstream, use the `upstream` remote
 (`https://github.com/RobTand/prismaquant`) directly.
 
+## Upstream sync history
+
+**2026-06-12 — merged `RobTand/prismaquant` `9f4a86b` (45 commits).**
+Upstream's canonical multi-layer-type rope landed, letting the fork drop
+two now-redundant patches: (1) the parallel per-layer `position_embeddings`
+recompute in `incremental_probe.py` — upstream's
+`{layer_type:(cos,sin)}` dict path (`_compute_position_embeddings` +
+per-layer-type selection in `_call_layer`) replaces it; and (2) the
+hand-rolled per-type `inv_freq` loop in the Gemma-4 `init_rotaries` —
+upstream re-runs the rotary's own `__init__` on-device (Fix #6). The
+Gemma-4 profile now **grafts** only its scaffolding cache-population onto
+upstream's `init_rotaries` (the nine structural caches `extra_layer_kwargs`
+consumes). The generic multi-layer-type rope fallback in `streaming_model`
+is retained as a backstop. Merge resolved 3 conflicts (C1 `layer_streaming`
+union, C2 `incremental_probe` dual-thread, C3 `gemma4` `init_rotaries`
+de-dup graft); hard gates green (prismaquant 567 passed, prismaquant-llama
+179 passed).
+
 ## Install for prismaquant-llama users
 
 ```bash
@@ -103,13 +125,13 @@ pip install -e .
 ## Validated arches via `prismaquant-llama`
 
 - `unsloth/gemma-3-4b-it` (multi-layer-type rope, sliding-window attention, partial rotary factor) — `Gemma3Profile`; unsloth checkpoint wrapping handled by `checkpoint_to_live_name` override
-- `google/gemma-4-E4B-it` (iSWA hybrid, partial rotary, kv-sharing) — required all 8 generic + 4 gemma-specific patches
+- `google/gemma-4-E4B-it` (iSWA hybrid, partial rotary, kv-sharing) — required all 7 generic + 4 gemma-specific patches
 - `nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16` (Mamba-2 + MoE hybrid) — generic patches sufficient through Stage C config + layer-list resolution; deeper Mamba-2-specific blockers tracked separately
 - `unsloth/gpt-oss-20b-BF16` (MoE) — `DefaultProfile` path; no patches needed beyond the generic NemotronH support already merged
 
 ## Upstreaming roadmap
 
-The 8 generic patches are clear bug fixes and good candidates for
+The 7 generic patches are clear bug fixes and good candidates for
 upstream PRs to `RobTand/prismaquant`. We're holding those PRs until
 prismaquant-llama is publicly released and the patches have a few weeks
 of in-use validation. Until then, this fork is the install target.
