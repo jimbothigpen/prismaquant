@@ -176,7 +176,7 @@ class Gemma4Profile(ModelProfile):
         over-allocation.
 
         Memory note: the embed_tokens_per_layer cost is significant on
-        small-VRAM systems. ai00-class machines (MI300X 192 GB, etc.)
+        small-VRAM systems. high-VRAM machines (MI300X 192 GB, etc.)
         absorb it trivially; for tighter VRAM budgets a future
         optimization could materialize → precompute → free instead of
         keeping the full table resident. The current head-resident
