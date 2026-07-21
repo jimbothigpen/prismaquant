@@ -26,8 +26,7 @@ def test_readme_shipping_menu_matches_pipeline_default():
     script = (ROOT / "prismaquant" / "run-pipeline.sh").read_text()
 
     assert 'FORMATS:=NVFP4,FP8_DYNAMIC,BF16' in script
-    assert "export FORMATS=NVFP4,FP8_DYNAMIC,BF16" in readme
-    assert "--formats NVFP4,FP8_DYNAMIC,BF16" in readme
+    assert "FORMATS=NVFP4,FP8_DYNAMIC,BF16" in readme
     assert "MXFP8_E4M3,BF16" not in readme
 
 

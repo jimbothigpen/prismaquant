@@ -19,6 +19,9 @@ cost. Set the env var to `"1"` to force a graph path for benchmarking, or
 | `PRISMAQUANT_COST_PREFETCH_ACT` | **on** | `measure_batched_gpu` prefetches chunk N+1's activation files on a thread pool while chunk N runs on the GPU. Hides ~30-40% of the cost step's wall on big models. |
 | `PRISMAQUANT_ALLOW_KV_SHARED_FISHER` | `0` | Probe guard override for KV-sharing architectures (e.g. Gemma4 `k_eq_v` layers): by default the probe fails fast when KV-shared Linears would receive aliased Fisher mass; set `1` to probe anyway, accepting the shared-gradient double-count. |
 | `PRISMAQUANT_ALLOW_SUMSQ_PACKED_FISHER` | `0` | Probe guard override for packed-MoE experts whose compute is NOT a per-expert `F.linear(x, packed[e])` (e.g. bmm/grouped-mm): the per-token Fisher interception cannot capture them, and by default the probe fails fast rather than fall back to squaring the token-summed weight gradient (the sum-then-square estimator, audit M3: 5-50× cross-token-covariance inflation). Set `1` to accept the biased legacy estimator. Also accepted by `prepare_cost_context` to reuse a PRE-FIX probe.pkl whose packed-expert entries lack the `packed_fisher_estimator=per_token_v2` meta stamp (stale pickles are otherwise refused). |
+| `PRISMAQUANT_EXPERT_COST_SAMPLE` | unset | Token sample count override for MoE expert empirical cost measurement. |
+| `PRISMAQUANT_GGUF_EXPERT_COST_SAMPLE` | unset | Token sample count override for GGUF MoE expert empirical cost measurement. |
+| `PRISMAQUANT_GEMMA4_DISABLE_PROPER_PLI` | `0` | Disable proper per-layer-input handling for Gemma 4 profile in streaming probe. |
 | `PRISMAQUANT_FISHER_OUTPUT_MSE_ALLOCATOR` | **archived** | Historical Fisher row-weighted allocator objective. The production pipeline rejects it; archive context lives under `archive/fisher_2026-05-15/`. |
 | `PRISMAQUANT_FISHER_OUTPUT_MSE_ROW_WEIGHT_CLIP` | archived companion | Historical cap for Fisher output-MSE allocation; not used by the production pipeline. |
 
@@ -49,6 +52,9 @@ cost. Set the env var to `"1"` to force a graph path for benchmarking, or
 | `PRISMAQUANT_GPTQ_BLOCK_SIZE` | `128` | Column block size for the FP-Quant-style GPTQ OBS update across NVFP4, FP8_DYNAMIC/FP8_E4M3, and explicit MX research formats. Quantizer scales are fixed before the solve; each column is quantized and its error is propagated through the current GPTQ block and later blocks. `PRISMAQUANT_FP8_GPTQ_BLOCK_SIZE` remains accepted as a backward-compatible alias when the new flag is unset. |
 | `PRISMAQUANT_MXFP8_JOINT_SCALE_SHIFTS` | ignored | Legacy candidate E8M0 exponent shifts for the removed MXFP8 joint-scale search. Production MXFP8 no longer consumes `joint_scale_opt`; it uses the canonical E8M0 scale rule inside GPTQ. |
 | `PRISMAQUANT_MXFP8_SCALE_SWEEP_SHIFTS` | `0` | Explicit-ablation candidate E8M0 exponent shifts for MXFP8_E4M3 activation-weighted scale search. The default is a no-op; nonzero shifts are experimental and refine the current accepted render under the same progressive gate. |
+| `PRISMAQUANT_EXPORT_INLINE_EXPERT_GPTQ` | `0` | Enables inline expert GPTQ optimization pass during export. |
+| `PRISMAQUANT_IQ_COMPILE_SWEEP` | `0` | Enables JIT compilation sweep for GGUF IQ grid generation. |
+| `PRISMAQUANT_TARGET_PROFILE` | unset | Runtime target serving profile override (e.g. `gguf` or `vllm`). |
 
 ## Pipeline production-cache flags
 
