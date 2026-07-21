@@ -92,6 +92,9 @@ If you need the unpatched upstream, use the `upstream` remote
 
 ## Upstream sync history
 
+**2026-07-21 — merged `RobTand/prismaquant` `69ff3f4` (193 commits).**
+Merged 193 commits from upstream (`upstream/main` HEAD `69ff3f4`). Brings in upstream's AURA cost model, GGUF container export, DeepSeek-V4-Flash / HY-V3 profiles, cross-layer residual modeling, and expanded test suite. All 955 unit tests passed.
+
 **2026-06-12 — merged `RobTand/prismaquant` `9f4a86b` (45 commits).**
 Upstream's canonical multi-layer-type rope landed, letting the fork drop
 two now-redundant patches: (1) the parallel per-layer `position_embeddings`
