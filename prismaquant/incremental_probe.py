@@ -15,7 +15,13 @@ regex. MTP is a built-in shard kind: after the body forward we synthesize
 a `MtpModule`, load `mtp.*` weights directly from safetensors, and run
 its own forward+backward for Fisher collection. The per-shard pickle
 output format matches `sensitivity_probe.run_probe_pass` / `streaming_probe`
-unchanged — the allocator consumes either.
+unchanged — the allocator consumes either. The two backends also agree on
+the estimator and normalization conventions: per-token-summed empirical
+Fisher (Σ_t ‖∇_t‖², including packed experts via the F.linear
+interception in `install_packed_expert_hooks`), divided by the tokens
+each entry actually saw (routed tokens for MoE experts — the single
+implicit ÷token-fraction; `run_probe_pass` used to apply a second
+÷route_prob, removed per audit M4).
 """
 from __future__ import annotations
 
@@ -61,14 +67,15 @@ import torch.nn.functional as F
 
 from .layer_streaming import (
     _call_layer,
+    _compute_attention_mask,
     _compute_position_embeddings,
     _get_final_norm,
-    _make_causal_mask,
 )
 from .sensitivity_probe import (
     FisherAccumulator,
     RouterTracker,
     discover_moe_structure,
+    h_detail_blob,
     install_packed_expert_hooks,
     load_calibration,
     per_token_ce,
@@ -957,6 +964,49 @@ def load_num_hidden_layers(model_path: str) -> int:
     return n
 
 
+def config_num_kv_shared_layers(model_path: str) -> int:
+    """``num_kv_shared_layers`` from the config (text_config or top-level).
+
+    Returns 0 when absent. Used by the MINOR-M33 guard: KV-sharing models
+    (num_kv_shared_layers>0, e.g. some Gemma4 variants) reuse one layer's
+    K/V in later layers, but the streaming Fisher probe captures and
+    ``.detach()``s borrowed K/V per isolated phase-3 forward, severing the
+    Fisher cotangent that should flow back to the *storing* layer's
+    k_proj/v_proj — under-counting their h_trace.
+    """
+    staged = stage_text_only(model_path)
+    cfg_path = Path(staged) / "config.json"
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+    text_cfg = cfg.get("text_config", cfg)
+    for src in (text_cfg, cfg):
+        if isinstance(src, dict):
+            v = src.get("num_kv_shared_layers")
+            if isinstance(v, int):
+                return int(v)
+    return 0
+
+
+def kv_shared_fisher_block_reason(model_path: str) -> str | None:
+    """Fail-fast message if the streaming Fisher probe must not run here.
+
+    Returns a message string when the model has ``num_kv_shared_layers>0`` and
+    the ``PRISMAQUANT_ALLOW_KV_SHARED_FISHER`` override is unset, else ``None``
+    (MINOR-M33). Extracted so the guard decision is unit-testable.
+    """
+    kv = config_num_kv_shared_layers(model_path)
+    if kv > 0 and os.environ.get("PRISMAQUANT_ALLOW_KV_SHARED_FISHER", "0") == "0":
+        return (
+            f"[incremental] model has num_kv_shared_layers={kv}: the streaming "
+            "Fisher probe under-counts the storing layer's k_proj/v_proj "
+            "h_trace (shared-consumer cotangent severed by the phase-3 K/V "
+            "detach; review finding MINOR-M33). Set "
+            "PRISMAQUANT_ALLOW_KV_SHARED_FISHER=1 to probe anyway, accepting "
+            "the k/v_proj under-count, until the KV-cotangent path lands."
+        )
+    return None
+
+
 # Streaming infrastructure — `StreamingContext`, `_build_streaming_context`,
 # and `_classify_shard` live in `streaming_model` so both the probe and
 # the cost measurement share one implementation.
@@ -1136,7 +1186,6 @@ def _compute_global_precompute(
     batch_size = calib.size(0)
     ids = calib.to(device)
     position_ids = torch.arange(tokens_in_sample, device=device).unsqueeze(0)
-    causal_mask = _make_causal_mask(tokens_in_sample, device, dtype)
 
     prefetch_depth = prefetch_lookahead
 
@@ -1161,6 +1210,7 @@ def _compute_global_precompute(
         hidden = _embed_mod(ids).to(dtype)
     position_embeddings = _compute_position_embeddings(
         base_model, hidden, position_ids)
+    causal_mask = _compute_attention_mask(base_model, hidden, position_ids)
 
     hidden = _profile.expand_hidden_for_layers(hidden, base_model)
 
@@ -1611,7 +1661,6 @@ def _run_body_streaming_shard(
     batch_size = calib.size(0)
 
     position_ids = torch.arange(tokens_in_sample, device=device).unsqueeze(0)
-    causal_mask = _make_causal_mask(tokens_in_sample, device, dtype)
 
     prefetch_depth = prefetch_lookahead
 
@@ -1626,6 +1675,7 @@ def _run_body_streaming_shard(
         embed0 = activations_cpu[0].to(device).to(dtype)
         position_embeddings = _compute_position_embeddings(
             base_model, embed0, position_ids)
+        causal_mask = _compute_attention_mask(base_model, embed0, position_ids)
         del embed0
     print(f"[incremental] shard reuses global precompute "
           f"N={batch_size} T={tokens_in_sample} "
@@ -2142,12 +2192,16 @@ def _run_body_streaming_shard(
             moe_block_handles.clear()
             moe_linear_to_block.clear()
 
-            packed_grad_acc: dict[str, float] = {}
+            # Scalar per-token-summed Fisher trace per packed param.
+            # Values are device-resident 0-dim fp32 tensors (flushed via
+            # float() below — one sync per packed param per layer).
+            packed_grad_acc: dict[str, torch.Tensor] = {}
             # Per-expert per-channel Fisher [E, M] — enables per-expert
             # h_trace decomposition for the allocator's packed-3D prune
             # cost without re-measuring cost per expert. Always enabled
             # here; the accumulator's memory is ~1 MB per packed param
-            # at 128 experts × 5760 channels, negligible on 121 GB RAM.
+            # at 128 experts × 5760 channels, negligible on 121 GB RAM
+            # (device-resident until the flush below).
             packed_channel_acc: dict[str, torch.Tensor] = {}
             packed_full_acc: dict[str, torch.Tensor] | None = (
                 {} if h_detail_dir is not None else None)
@@ -2324,17 +2378,17 @@ def _run_body_streaming_shard(
                     acc_stats[full_key]["n_tokens_seen"] = \
                         acc_stats[full_key].get("n_tokens_seen", 0) + x_in.size(0) * x_in.size(1)
             # Per-expert Fisher trace decomposition. channel_acc[key] is
-            # [E, M] (grad² summed over the in-feature dim); summing over
-            # M collapses to [E] — per-expert Fisher trace. Stored as a
-            # float list in the stat entry so it survives pickle + merge
-            # without torch-device round-trips, and the allocator's
-            # add_packed_prune_candidates reads it directly.
+            # [E, M] (per-token-summed Σ_t gy_{e,t,m}²·‖x_{e,t}‖²);
+            # summing over M collapses to [E] — per-expert Fisher trace.
+            # Stored as a float list in the stat entry so it survives
+            # pickle + merge without torch-device round-trips, and the
+            # allocator's add_packed_prune_candidates reads it directly.
             for local_key, per_ch in packed_channel_acc.items():
                 full_key = f"{layer_prefix}{local_key}"
                 if full_key not in acc_stats:
                     continue
-                # per_ch is on CPU fp32; summing over the last dim gives
-                # per-expert trace without a device sync.
+                # per_ch is fp32 (device-resident); the .tolist() below is
+                # the single flush sync for this packed param.
                 per_expert_trace = per_ch.sum(dim=-1).to(torch.float64)
                 prev = acc_stats[full_key].get("h_trace_per_expert_raw")
                 if prev is None:
@@ -2386,8 +2440,16 @@ def _run_body_streaming_shard(
                 for local_key, tensor in packed_full_acc.items():
                     full_key = f"{layer_prefix}{local_key}"
                     fname = re.sub(r"[^A-Za-z0-9_-]", "__", full_key) + ".pt"
-                    torch.save({"H": tensor, "name": full_key},
-                               detail_dir / fname)
+                    # Per-token units + explicit marker (audit M9): the
+                    # accumulator is token-summed; normalize by this
+                    # layer's token count so the blob matches the
+                    # sensitivity-probe writer's units.
+                    entry = acc_stats.get(full_key, {})
+                    torch.save(
+                        h_detail_blob(tensor,
+                                      int(entry.get("n_tokens_seen", 0)),
+                                      full_key, kind="packed"),
+                        detail_dir / fname)
                 packed_full_acc.clear()
             # Body layer FQNs are unique within the shard, so activation
             # snapshots can be flushed as soon as that layer has run.
@@ -2458,13 +2520,17 @@ def _run_body_streaming_shard(
                 torch.cat(g2_parts, dim=0).to(torch.float32).cpu()
                 if g2_parts else torch.empty(0, dtype=torch.float32)
             )
+            # Per-token units + explicit marker (audit M9): this writer
+            # used to save the raw token-summed accumulator under "H",
+            # leaving HDetailIndex consumers ~n_tokens× hotter than
+            # blobs from sensitivity_probe. h_detail_blob normalizes by
+            # the tokens this Linear actually saw and stamps
+            # units="per_token"; g2_per_token stays raw (it is already
+            # a per-token vector).
+            tokens = int(merged_stats.get(fqn, {}).get("n_tokens_seen", 0))
             torch.save(
-                {
-                    "H": h,
-                    "name": fqn,
-                    "g2_per_token": g2_per_token,
-                    "h_detail_version": 2,
-                },
+                h_detail_blob(h, tokens, fqn, kind="linear",
+                              g2_per_token=g2_per_token),
                 detail_dir / fname,
             )
 
@@ -2727,7 +2793,11 @@ def _run_mtp_streaming_shard(
         t_fwd += time.time() - t0
 
         t0 = time.time()
-        lp = F.log_softmax(logits.reshape(-1, logits.size(-1)), dim=-1)
+        # .float() before log_softmax: matches the phase-2 chunked CE
+        # sites (which cast lm_head output to fp32 first) — bf16
+        # log_softmax costs ~0.4% rel on the Fisher CE gradient.
+        lp = F.log_softmax(logits.reshape(-1, logits.size(-1)).float(),
+                           dim=-1)
         gather = -lp.gather(1, target_ids.reshape(-1, 1)).squeeze(1)
         if importance_weighting:
             with torch.no_grad():
@@ -2920,6 +2990,16 @@ def main():
     ap.add_argument("--mm-max-text-len", type=int, default=128,
                     help="Max text tokens per multimodal calibration sample.")
     args = ap.parse_args()
+
+    # MINOR-M33: on KV-sharing models the streaming Fisher probe under-counts
+    # the storing layer's k_proj/v_proj h_trace — the phase-3 K/V detach severs
+    # the Fisher cotangent from consumer layers that reuse its K/V. Fail loud
+    # rather than ship a silently-biased allocation (Principle 1: measurement
+    # gap, not a band-aid). No shipped model triggers this (Gemma4-31B-IT and
+    # the Gemma4TextConfig default are num_kv_shared_layers=0).
+    _kv_block = kv_shared_fisher_block_reason(args.model)
+    if _kv_block:
+        raise SystemExit(_kv_block)
 
     n_layers = load_num_hidden_layers(args.model)
     start = max(0, args.start_layer)
@@ -3542,6 +3622,11 @@ def main():
         _merged = pickle.load(_f)
     _meta = dict(_merged.get("meta", {}))
     _meta["calibration_modality"] = args.calibration_modality
+    # Estimator provenance: packed-expert h_trace is the per-token
+    # estimator since the 2026-07-02 M3 fix (pre-fix pickles carry the
+    # sum-then-square 5-50x inflated values and are refused by
+    # prepare_cost_context unless explicitly allowed).
+    _meta["packed_fisher_estimator"] = "per_token_v2"
     _merged["meta"] = _meta
     with open(args.output, "wb") as _f:
         pickle.dump(_merged, _f)

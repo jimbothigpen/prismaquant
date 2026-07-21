@@ -179,10 +179,40 @@ class HDetailIndex:
 
     @staticmethod
     def h_diag_from_blob(blob: dict) -> torch.Tensor:
+        """Return the Fisher diagonal from an h-detail blob, in PER-TOKEN
+        units.
+
+        Both writers (`sensitivity_probe.FisherAccumulator.finalize` and
+        `incremental_probe`) now normalize by token count and stamp
+        ``units: "per_token"`` via `sensitivity_probe.h_detail_blob`
+        (audit M9). Legacy blobs without the marker:
+
+          - ``h_diag``: accepted as per-token — that writer always
+            divided by token count. Caveat: pre-v3 sensitivity blobs for
+            UNPACKED expert Linears additionally divided by route_prob
+            (audit M4) and are indistinguishable from the blob alone;
+            regenerate such h-detail dirs if expert rows matter.
+          - raw ``H``: the old incremental writer's token-SUMMED
+            accumulator — ~n_tokens× hot for this consumer. Refuse
+            rather than silently mis-scale predicted_dloss; regenerate
+            the h-detail directory with the current probe.
+        """
+        units = blob.get("units")
+        if units is not None and units != "per_token":
+            raise ValueError(
+                f"h-detail blob {blob.get('name')!r} has unknown units "
+                f"{units!r}; this consumer requires 'per_token'.")
         if "h_diag" in blob:
             return blob["h_diag"]
         if "H" in blob:
-            return blob["H"]
+            if units == "per_token":
+                return blob["H"]
+            raise ValueError(
+                f"h-detail blob {blob.get('name')!r} carries a raw "
+                "token-summed 'H' tensor with no units marker (legacy "
+                "incremental_probe writer). Its scale is ~n_tokens× off "
+                "for predicted_dloss; regenerate the h-detail directory "
+                "with the current probe instead of consuming it.")
         raise KeyError("h-detail blob has neither 'h_diag' nor 'H'")
 
 
@@ -445,9 +475,24 @@ def measure_unbatched(model: nn.Module, act_cache: "ActivationIndex",
                 W.device,
             )
 
+        gguf_qw = None
+        if _gguf_imatrix_enabled() and any(s.family == "gguf" for s in specs):
+            # Same op/data as export_gguf.build_imatrix_from_act_cache and
+            # the batched path: full fp32 rows, mean over dim 0.
+            gguf_qw = X_cpu.float().pow(2).mean(dim=0).to(W.device)
+
         for spec in specs:
             try:
-                W_hat = spec.quantize_dequantize(W.clone())
+                if spec.family == "gguf" and gguf_qw is not None:
+                    from prismaquant.gguf_formats import (
+                        gguf_quantize_dequantize,
+                    )
+
+                    W_hat = gguf_quantize_dequantize(
+                        W.clone(), spec.name, col_weights=gguf_qw,
+                    )
+                else:
+                    W_hat = spec.quantize_dequantize(W.clone())
                 X_hat = spec.activation_quantize_dequantize(X.clone())
                 err = (W - W_hat).float()
                 weight_mse = float(err.pow(2).mean().item())
@@ -565,9 +610,29 @@ def _packed_experts_router(parent_module: nn.Module | None) -> nn.Module | None:
 def _packed_router_topk(
     router: nn.Module,
     hidden_states: torch.Tensor,
+    e_score_correction_bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return (top_k_index, top_k_weights) for a Qwen/DeepSeek-style router."""
-    out = router(hidden_states)
+    """Return (top_k_index, top_k_weights) for a Qwen/DeepSeek-style router.
+
+    Some routers (HYV3TopKRouter) take the parent MoE block's
+    e_score_correction_bias buffer as a required positional — callers pass
+    it from ``parent_mod`` so routing matches the model's real forward."""
+    import inspect
+    try:
+        fwd_params = inspect.signature(router.forward).parameters
+    except (TypeError, ValueError):
+        fwd_params = {}
+    if "e_score_correction_bias" in fwd_params:
+        if e_score_correction_bias is None:
+            raise ValueError(
+                f"{type(router).__name__}.forward requires "
+                "e_score_correction_bias; the parent module must supply it")
+        out = router(
+            hidden_states,
+            e_score_correction_bias.to(hidden_states.device),
+        )
+    else:
+        out = router(hidden_states)
     if isinstance(out, (tuple, list)):
         if len(out) >= 3:
             second = out[1]
@@ -670,6 +735,98 @@ def _packed_experts_forward_with_weights(
     return final_hidden_states
 
 
+def derive_per_expert_activations(
+    experts_mod: nn.Module,
+    X: torch.Tensor,
+    parent_mod: nn.Module | None,
+    *,
+    capture_down: bool = True,
+    max_rows_per_expert: int | None = None,
+    subsample_seed: int = 1234,
+) -> dict:
+    """Single source of truth for per-expert GPTQ activations.
+
+    Routes the module-level expert input ``X`` ([*, hidden]) through the MoE
+    block's own router and collects, per expert ``e``, exactly the tensors the
+    per-expert GPTQ Hessian needs — identical to the routed forward in
+    ``_packed_experts_forward_with_weights``, but COLLECTING activations instead
+    of producing the output. Shared by the cost path and the export render path
+    so the routing + SwiGLU derivation lives in ONE place (no duplication).
+
+    Returns a dict of length-E lists:
+      - ``gate_up``: each [n_e, hidden]  — the routed input to ``gate_up_proj``.
+      - ``down``:    each [n_e, inter]   — the post-SwiGLU input to ``down_proj``
+                     (``_apply_gate(gate_up)`` when present, else ``act_fn(gate)*up``).
+                     Empty list when ``capture_down=False``.
+      - ``gate_weights``: each [n_e]     — the router weight per routed token.
+      - ``row_counts``: list[int]        — routed tokens/expert BEFORE subsample
+                     (use for the fail-on-insufficient-routed-rows gate).
+
+    Subsampling (``max_rows_per_expert``) is deterministic (fixed ``subsample_seed``)
+    so the render is reproducible. ``None`` keeps every routed row. Raises (never
+    silently degrades) if the router / act_fn cannot be resolved.
+    """
+    gate_up_w = getattr(experts_mod, "gate_up_proj", None)
+    if gate_up_w is None:
+        raise ValueError("packed experts module lacks gate_up_proj")
+    num_experts = int(getattr(experts_mod, "num_experts", gate_up_w.size(0)))
+    act_fn = getattr(experts_mod, "act_fn", None)
+    apply_gate = getattr(experts_mod, "_apply_gate", None)
+    router = _packed_experts_router(parent_mod)
+    if router is None:
+        raise ValueError("no router found for packed-experts module")
+    Xf = X.reshape(-1, X.size(-1))
+    dev, dt, hidden = Xf.device, Xf.dtype, Xf.size(-1)
+    inter = gate_up_w.size(1) // 2
+    with torch.no_grad():
+        route_fn = getattr(parent_mod, "route_tokens_to_experts", None)
+        if callable(route_fn):
+            top_k_index, top_k_weights = route_fn(router(Xf))
+        else:
+            top_k_index, top_k_weights = _packed_router_topk(
+                router, Xf,
+                e_score_correction_bias=getattr(
+                    parent_mod, "e_score_correction_bias", None),
+            )
+        expert_mask = F.one_hot(
+            top_k_index.to(torch.long), num_classes=num_experts).permute(2, 1, 0)
+    gate_up_list: list[torch.Tensor] = []
+    down_list: list[torch.Tensor] = []
+    gw_list: list[torch.Tensor] = []
+    counts: list[int] = []
+    for e in range(num_experts):
+        top_k_pos, token_idx = torch.where(expert_mask[e])
+        n = int(token_idx.numel())
+        counts.append(n)
+        if n == 0:
+            gate_up_list.append(torch.empty(0, hidden, device=dev, dtype=dt))
+            gw_list.append(torch.empty(0, device=dev, dtype=dt))
+            if capture_down:
+                down_list.append(torch.empty(0, inter, device=dev, dtype=dt))
+            continue
+        if max_rows_per_expert is not None and n > max_rows_per_expert:
+            gen = torch.Generator(device=dev).manual_seed(subsample_seed + e)
+            keep = torch.randperm(n, device=dev, generator=gen)[:max_rows_per_expert]
+            token_idx, top_k_pos = token_idx[keep], top_k_pos[keep]
+        Xe = Xf[token_idx]
+        gate_up_list.append(Xe)
+        gw_list.append(top_k_weights[token_idx, top_k_pos])
+        if capture_down:
+            with torch.no_grad():
+                gate_up = F.linear(Xe, gate_up_w[e])
+                if callable(apply_gate):
+                    di = apply_gate(gate_up)
+                elif act_fn is not None:
+                    g, u = gate_up.chunk(2, dim=-1)
+                    di = act_fn(g) * u
+                else:
+                    raise ValueError(
+                        "packed experts module exposes neither _apply_gate nor act_fn")
+            down_list.append(di)
+    return {"gate_up": gate_up_list, "down": down_list,
+            "gate_weights": gw_list, "row_counts": counts}
+
+
 def _packed_expert_activation_quantizer(spec: fr.FormatSpec):
     def _quantize(x: torch.Tensor) -> torch.Tensor:
         return spec.activation_quantize_dequantize(x.clone())
@@ -748,7 +905,11 @@ def _measure_packed_experts(
                     if callable(_route_fn):
                         top_k_index, top_k_weights = _route_fn(router(X))
                     else:
-                        top_k_index, top_k_weights = _packed_router_topk(router, X)
+                        top_k_index, top_k_weights = _packed_router_topk(
+                            router, X,
+                            e_score_correction_bias=getattr(
+                                parent_mod, "e_score_correction_bias", None),
+                        )
                     y_ref = _packed_experts_forward_with_weights(
                         experts_mod,
                         X,
@@ -779,10 +940,55 @@ def _measure_packed_experts(
             h = h_detail.load(full_name).to(dev).float()
             if h.shape == (w.size(0), w.size(1)):
                 h_em = h
+        packed_gguf_qw = None
+        if _gguf_imatrix_enabled() and any(s.family == "gguf" for s in specs):
+            # Pooled imatrix from the experts-module input snapshot: exact
+            # source for gate_up_proj (its input IS the module input); the
+            # shape guard leaves down_proj unweighted (its input is the
+            # per-expert intermediate, not cached — the v2 replay pass will
+            # weight it). MUST stay op-identical to the exporter's builder
+            # (full rows, fp32, mean over dim 0) — lockstep contract.
+            try:
+                _x = act_cache.load(experts_qname)
+                qw_vec = _x.float().pow(2).mean(dim=0)
+                if qw_vec.numel() == w.shape[-1]:
+                    packed_gguf_qw = qw_vec.reshape(1, 1, -1).to(dev)
+            except Exception:
+                packed_gguf_qw = None
+
+        # Optional stratified expert subsample for gguf-family COST entries:
+        # the allocator prices the whole stack as one unit (mean over
+        # experts), so sampling S of E experts estimates that mean at E/S
+        # less quantize work (IQ exhaustive-grid on 3.5G-elem stacks is
+        # ~25 min/layer at full E — 2026-07-11). Export always quantizes
+        # every expert exactly; this only affects the DP's cost estimates.
+        sample_n = int(os.environ.get(
+            "PRISMAQUANT_EXPERT_COST_SAMPLE",
+            os.environ.get("PRISMAQUANT_GGUF_EXPERT_COST_SAMPLE", "0"),
+        ) or 0)
         for spec in specs:
             try:
-                w_hat = _batched_quantize(spec, w)
-                err = (w - w_hat).float()
+                # Family-agnostic: NVFP4/FP8 registry quantize on a full
+                # 2.4G-elem stack swap-kills a UMA box just like the gguf
+                # search did (2026-07-11 CT cost abort at layer 1).
+                use_sample = (
+                    sample_n > 0
+                    and w.ndim >= 3 and int(w.shape[0]) > sample_n
+                )
+                if use_sample:
+                    s_idx = torch.linspace(
+                        0, w.shape[0] - 1, sample_n, device=w.device,
+                    ).round().long().unique()
+                    w_in = w[s_idx]
+                else:
+                    w_in = w
+                w_hat = _batched_quantize(
+                    spec, w_in,
+                    col_weights=(
+                        packed_gguf_qw if spec.family == "gguf" else None
+                    ),
+                )
+                err = (w_in - w_hat).float()
                 weight_mse = float(err.pow(2).mean().item())
                 dloss_val = None
                 if h_em is not None:
@@ -801,15 +1007,24 @@ def _measure_packed_experts(
                     # (Σ_n g²)(Σ_n err²) and inflate packed-expert Δloss ~N×
                     # relative to dense Linears, over-promoting experts in
                     # the allocator (N = in-features ≈ 1.5k–4k).
-                    per_ch_mse = err.pow(2).mean(dim=-1)   # [E, M]
-                    dloss_val = float(
-                        0.5 * (h_em * per_ch_mse).sum().item()
-                    )
+                    per_ch_mse = err.pow(2).mean(dim=-1)   # [E or S, M]
+                    if use_sample:
+                        # Unbiased estimate of the full-stack sum from the
+                        # stratified sample.
+                        scale = float(w.shape[0]) / float(w_in.shape[0])
+                        dloss_val = float(
+                            0.5 * (h_em[s_idx] * per_ch_mse).sum().item()
+                            * scale
+                        )
+                    else:
+                        dloss_val = float(
+                            0.5 * (h_em * per_ch_mse).sum().item()
+                        )
                     del per_ch_mse
                 output_mse = 0.0
                 rel_mse = 0.0
                 output_mse_measured = False
-                if can_measure_output:
+                if can_measure_output and not use_sample:
                     act_quant = _packed_expert_activation_quantizer(spec)
                     with torch.no_grad():
                         if param_name == "gate_up_proj":
@@ -952,8 +1167,73 @@ _CODEBOOK_NAMES = {
 }
 
 
-def _batched_quantize(spec: fr.FormatSpec, stacked_w: torch.Tensor) -> torch.Tensor:
+def _gguf_imatrix_enabled() -> bool:
+    """PRISMAQUANT_GGUF_IMATRIX: activation-weighted (imatrix) scale
+    selection for GGUF k-quant cost measurement. Default ON — the GGUF
+    exporter ships imatrix-weighted bytes (--imatrix-from-act-cache), so
+    the cost the allocator optimizes must be measured on the same render
+    or the A/B has a rendering confound. Set =0 only together with an
+    unweighted export."""
+    # Parse MUST stay in lockstep with run-pipeline.sh's shell parse:
+    # set-but-empty means default (on); 0/false/no/off in any case = off.
+    value = os.environ.get("PRISMAQUANT_GGUF_IMATRIX", "1").strip().lower() or "1"
+    return value not in {"0", "false", "no", "off"}
+
+
+def _batched_quantize(
+    spec: fr.FormatSpec,
+    stacked_w: torch.Tensor,
+    col_weights: torch.Tensor | None = None,
+) -> torch.Tensor:
     elt = spec.weight_element_dtype
+    if spec.family == "nv":
+        # NVFP4 registry weights are export-codec-aligned (one rendering
+        # everywhere); the registry fn reshapes (-1, in) internally, so it
+        # is natively batch-shaped. Using the local codebook replica here
+        # would re-introduce the resident-vs-export scale mismatch the
+        # alignment removed (cost values must match the unbatched path,
+        # which calls spec.quantize_dequantize).
+        # Per-slice: the export codec derives a per-TENSOR global scale,
+        # and each stacked Linear must get its own (matching unbatched).
+        return torch.stack([
+            spec.quantize_dequantize(stacked_w[i].clone())
+            for i in range(stacked_w.shape[0])
+        ])
+    if spec.family == "gguf":
+        # GGUF k-quants: the registry qdq reshapes (..., in) internally and
+        # every scale is local to a 256-superblock (no per-tensor state), so
+        # the stacked (N, out, in) tensor quantizes in one call and matches
+        # the unbatched path bit-for-bit. col_weights (per-item imatrix
+        # vectors, broadcastable to stacked_w) bias scale selection exactly
+        # as the exporter's --imatrix-from-act-cache does.
+        # Big stacks (192-expert MoE layers ~2.4G elements) are sliced along
+        # dim 0 — exact by superblock locality — or the search's fp32
+        # temporaries (~20x element count) blow the unified-memory budget.
+        from prismaquant.gguf_formats import (
+            gguf_quantize_dequantize,
+            gguf_slice_max_elems,
+        )
+
+        max_elems = gguf_slice_max_elems(spec.name)
+        if stacked_w.ndim >= 2 and stacked_w.numel() > max_elems:
+            step = max(1, max_elems // max(stacked_w[0].numel(), 1))
+            outs = []
+            for i in range(0, stacked_w.shape[0], step):
+                cw = col_weights
+                if cw is not None and cw.ndim >= 1 and cw.shape[0] == stacked_w.shape[0]:
+                    cw = cw[i:i + step]
+                outs.append(gguf_quantize_dequantize(
+                    stacked_w[i:i + step], spec.name, col_weights=cw,
+                ))
+            return torch.cat(outs, dim=0)
+        return gguf_quantize_dequantize(
+            stacked_w, spec.name, col_weights=col_weights,
+        )
+    if col_weights is not None:
+        raise ValueError(
+            f"col_weights is only supported for gguf-family formats, "
+            f"got {spec.name}"
+        )
     if elt in _CODEBOOK_NAMES:
         # Reuse the registry's codebook tables. MX-family formats need
         # E8M0 scale snapping to match the OCP MX serving path; NV/FP
@@ -1073,6 +1353,21 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
                 idx[:chunk_min_rows] if isinstance(idx, torch.Tensor) else None
                 for idx in row_indices_cpu
             ]
+            gguf_qw = None
+            if _gguf_imatrix_enabled() and any(
+                s.family == "gguf" for s in specs
+            ):
+                # Per-item imatrix, computed with the IDENTICAL op on the
+                # IDENTICAL data as export_gguf.build_imatrix_from_act_cache
+                # (FULL fp32 CPU act rows, mean over dim 0) — NOT from the
+                # chunk-truncated compute-dtype X. The k-quant scale search
+                # is a discrete grid: a numerically different importance
+                # vector can flip (sc, m, q) choices, and then the measured
+                # cost would not describe the shipped bytes. Must run
+                # before acts_cpu is freed below.
+                gguf_qw = torch.stack([
+                    a.float().pow(2).mean(dim=0) for a in acts_cpu
+                ]).unsqueeze(1).to(dev)  # (N, 1, in)
             del acts_cpu, act_items_cpu
             # Reference output (per-item BMM): shape (N, rows, out)
             y_ref = torch.bmm(X, W.transpose(1, 2))
@@ -1124,7 +1419,12 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
 
             for spec in specs:
                 try:
-                    W_hat = _batched_quantize(spec, W)
+                    W_hat = _batched_quantize(
+                        spec, W,
+                        col_weights=(
+                            gguf_qw if spec.family == "gguf" else None
+                        ),
+                    )
                     X_hat = spec.activation_quantize_dequantize(X.clone())
                     err = (W - W_hat).float()
                     weight_mse = err.pow(2).mean(dim=(1, 2))  # (N,)
@@ -1212,6 +1512,30 @@ def prepare_cost_context(probe_path: str,
         probe = pickle.load(f)
     stats = probe["stats"]
     print(f"[cost] loaded probe stats for {len(stats)} Linears")
+
+    # Refuse pre-fix packed-expert probes: before the 2026-07-02 M3 fix the
+    # packed h_trace was sum-then-square (5-50x cross-token-covariance
+    # inflation, calibration-length dependent). Version-stamped pickles are
+    # required whenever packed-expert entries are present, so a stale
+    # probe.pkl reused via skip-if-exists cannot silently drive allocations.
+    has_packed = any(
+        isinstance(m, dict) and m.get("_packed_experts_module")
+        for m in stats.values()
+    )
+    estimator = (probe.get("meta") or {}).get("packed_fisher_estimator")
+    if has_packed and estimator != "per_token_v2":
+        if os.environ.get(
+                "PRISMAQUANT_ALLOW_SUMSQ_PACKED_FISHER", "0") != "1":
+            raise SystemExit(
+                f"probe {probe_path} contains packed-expert entries but no "
+                f"packed_fisher_estimator=per_token_v2 marker (found: "
+                f"{estimator!r}) — it predates the 2026-07-02 per-token "
+                "packed-Fisher fix and its expert h_trace values are "
+                "sum-then-square inflated (5-50x). Regenerate the probe, or "
+                "set PRISMAQUANT_ALLOW_SUMSQ_PACKED_FISHER=1 to accept the "
+                "biased legacy estimator.")
+        print("[cost] WARNING: accepting pre-fix sum-then-square packed "
+              "Fisher probe (PRISMAQUANT_ALLOW_SUMSQ_PACKED_FISHER=1)")
 
     cache = Path(activation_cache_dir)
     if not cache.exists():

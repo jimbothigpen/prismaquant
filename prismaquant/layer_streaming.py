@@ -20,6 +20,7 @@ import json
 import os
 import re
 from collections import defaultdict
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -169,21 +170,105 @@ def _build_weight_map(model_path: str, *,
     return model_to_shard, model_to_ckpt
 
 
+class Fp8ScaleInvMap(dict):
+    """`{model_weight_key: (scale_shard_path, scale_ckpt_key)}` plus the
+    checkpoint-declared dequant ``block`` size ``(rows, cols)``.
+
+    Behaves as a plain dict everywhere (truthiness, lookups, iteration),
+    so every existing caller is unchanged; the block size travels with
+    the map so the dequant call sites never have to re-derive it — or
+    worse, assume 128x128 for a checkpoint quantized at a different
+    granularity.  ``block`` is None only for empty maps."""
+
+    def __init__(self, data=None, block: tuple[int, int] | None = None):
+        super().__init__(data or {})
+        self.block = block
+
+
+def _declared_weight_block_size(model_path: str) -> tuple[int, int]:
+    """Read `quantization_config.weight_block_size` from the checkpoint
+    config and validate it.
+
+    Called only when fp8 block-scaled weights were actually found, so a
+    missing/null/malformed declaration is a hard error: the dequant grid
+    must be derived from the checkpoint, never assumed (the historical
+    hardcoded 128x128 silently mis-scales any checkpoint quantized at a
+    different block size, and per-tensor-scale fp8 checkpoints — e.g.
+    Mistral-Medium's scalar `weight_scale_inv` — are not block-dequantable
+    at all)."""
+    cfg_path = os.path.join(model_path, "config.json")
+    try:
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+    except Exception as exc:
+        raise RuntimeError(
+            f"checkpoint at {model_path!r} pairs fp8 weights with scale "
+            f"tensors but its config.json could not be read ({exc!r}); "
+            f"cannot derive the fp8 dequant block size"
+        ) from exc
+    qc = cfg.get("quantization_config") or {}
+    if not qc.get("weight_block_size"):
+        # Multimodal umbrellas may nest the quantization config.
+        nested = (cfg.get("text_config") or {}).get("quantization_config") or {}
+        if nested.get("weight_block_size"):
+            qc = nested
+    wbs = qc.get("weight_block_size")
+    if not wbs:
+        raise RuntimeError(
+            f"checkpoint at {model_path!r} pairs fp8 weights with scale "
+            f"tensors but config.json quantization_config.weight_block_size "
+            f"is {'null/empty' if 'weight_block_size' in qc else 'absent'}; "
+            f"refusing to assume a 128x128 dequant grid. Block-scaled fp8 "
+            f"checkpoints must declare weight_block_size; per-tensor-scale "
+            f"fp8 checkpoints are not supported by the block-dequant "
+            f"streaming path."
+        )
+    try:
+        pair = tuple(int(v) for v in wbs)
+    except (TypeError, ValueError):
+        pair = ()
+    if len(pair) != 2 or pair[0] <= 0 or pair[1] <= 0:
+        raise RuntimeError(
+            f"checkpoint at {model_path!r} declares an unsupported "
+            f"quantization_config.weight_block_size={wbs!r}; expected two "
+            f"positive ints [out_block, in_block]."
+        )
+    return (pair[0], pair[1])
+
+
+def _fp8_dequant_block(
+    fp8_scale_inv_map: dict[str, tuple[str, str]] | None,
+) -> tuple[int, int]:
+    """Dequant block size carried by the scale map.
+
+    Every map built by `_build_fp8_scale_inv_map` is an `Fp8ScaleInvMap`
+    holding the checkpoint-declared block. Plain dicts (hand-built in
+    tests/tools) keep the historical 128x128 default."""
+    block = getattr(fp8_scale_inv_map, "block", None)
+    if block is not None:
+        return (int(block[0]), int(block[1]))
+    return (128, 128)
+
+
 def _build_fp8_scale_inv_map(model_path: str, *,
                              multimodal: bool = False
-                             ) -> dict[str, tuple[str, str]]:
+                             ) -> "Fp8ScaleInvMap":
     """Return `{model_weight_key: (scale_shard_path, scale_ckpt_key)}`
     for every native-FP8 weight tensor (fp8_e4m3fn + paired
-    `.weight_scale_inv` fp32 block scale).
+    `.weight_scale_inv` fp32 block scale), as an `Fp8ScaleInvMap` whose
+    `.block` carries the checkpoint-declared
+    `quantization_config.weight_block_size`.
 
     The key space matches what `_build_weight_map` returns — i.e., the
     live model qname for the weight (`...something.weight`). Callers
     pair it with `_read_layer_to_device(..., fp8_scale_inv_map=...)`
-    to apply the 128x128 block dequant inline at load.
+    to apply the declared block dequant inline at load.
 
-    Returns `{}` for checkpoints that have no `.weight_scale_inv`
-    tensors — load-time dequant is then a no-op and callers behave
-    exactly as they did before this function existed.
+    Returns an empty map (block=None) for checkpoints that have no
+    `.weight_scale_inv` tensors — load-time dequant is then a no-op and
+    callers behave exactly as they did before this function existed.
+    A non-empty map with no readable/declared weight_block_size raises
+    (see `_declared_weight_block_size`).
     """
     # Profile-driven dispatch (refactor #32). Profiles that store FP8
     # scales under a non-standard path (DSv4 uses `.scale` siblings)
@@ -194,7 +279,10 @@ def _build_fp8_scale_inv_map(model_path: str, *,
     profile = detect_profile(model_path)
     explicit = profile.fp8_scale_pairs(model_path)
     if explicit is not None:
-        return explicit
+        return Fp8ScaleInvMap(
+            explicit,
+            _declared_weight_block_size(model_path) if explicit else None,
+        )
 
     index_file = os.path.join(model_path, "model.safetensors.index.json")
     if os.path.exists(index_file):
@@ -203,7 +291,7 @@ def _build_fp8_scale_inv_map(model_path: str, *,
     else:
         single = os.path.join(model_path, "model.safetensors")
         if not os.path.exists(single):
-            return {}
+            return Fp8ScaleInvMap()
         with safe_open(single, framework="pt") as f:
             raw = {k: single for k in f.keys()}
 
@@ -222,15 +310,45 @@ def _build_fp8_scale_inv_map(model_path: str, *,
         if weight_live is None:
             continue
         out[weight_live] = (os.path.join(model_path, shard), ck_key)
-    return out
+    return Fp8ScaleInvMap(
+        out,
+        _declared_weight_block_size(model_path) if out else None,
+    )
+
+
+def _check_fp8_scale_grid(
+    name: str,
+    weight_shape: tuple[int, ...],
+    scale_shape: tuple[int, ...],
+    block: tuple[int, int],
+) -> None:
+    """Hard shape assertion for a block-scale grid vs its weight.
+
+    A transposed `(in_blocks, out_blocks)` grid is numel-compatible with
+    the expected `(out_blocks, in_blocks)` reshape, so without this check
+    it reshapes silently and mis-scales every block."""
+    out_dim, in_dim = int(weight_shape[0]), int(weight_shape[1])
+    block_r, block_c = block
+    expected = (-(-out_dim // block_r), -(-in_dim // block_c))
+    if tuple(scale_shape) != expected:
+        raise ValueError(
+            f"fp8 weight_scale_inv for {name!r} has shape "
+            f"{tuple(scale_shape)}; expected (out_blocks, in_blocks)="
+            f"{expected} for weight {tuple(weight_shape)} at block "
+            f"{tuple(block)}. A transposed (in_blocks, out_blocks) grid is "
+            f"numel-compatible and would reshape silently, mis-scaling "
+            f"every block — check the checkpoint's scale layout and its "
+            f"declared quantization_config.weight_block_size."
+        )
 
 
 def _dequant_fp8_block_weight(
     weight: torch.Tensor,
     scale_inv: torch.Tensor,
     block: tuple[int, int] = (128, 128),
+    name: str = "<weight>",
 ) -> torch.Tensor:
-    """Apply the (ceil(out/128), ceil(in/128)) block scale to a 2D
+    """Apply the (ceil(out/block_r), ceil(in/block_c)) block scale to a 2D
     fp8-sourced weight and return bf16. Used by the fp8-aware streaming
     loader for native-FP8 checkpoints (MiniMax-M2/M2.7, DeepSeek-V3).
 
@@ -251,6 +369,8 @@ def _dequant_fp8_block_weight(
     """
     out_dim, in_dim = weight.shape
     block_r, block_c = block
+    _check_fp8_scale_grid(
+        name, tuple(weight.shape), tuple(scale_inv.shape), block)
     target_dtype = torch.bfloat16
     target_device = (scale_inv.device if scale_inv.device.type != "cpu"
                      else weight.device)
@@ -279,13 +399,64 @@ def _is_fp8_scaled_tensor(
     return fp8_scale_inv_map is not None and model_name in fp8_scale_inv_map
 
 
+_FLOAT8_DTYPES = frozenset(
+    dt for dt in (
+        getattr(torch, name, None)
+        for name in (
+            "float8_e4m3fn",
+            "float8_e4m3fnuz",
+            "float8_e5m2",
+            "float8_e5m2fnuz",
+            "float8_e8m0fnu",
+        )
+    ) if dt is not None
+)
+
+
+def _allow_unscaled_fp8() -> bool:
+    raw = os.environ.get("PRISMAQUANT_ALLOW_UNSCALED_FP8")
+    return raw not in (None, "", "0", "false", "False", "FALSE", "no", "NO")
+
+
+def _require_fp8_scale(
+    model_name: str,
+    t: torch.Tensor,
+    fp8_scale_inv_map: dict[str, tuple[str, str]] | None,
+) -> None:
+    """Fail fast on a float8 source tensor with no dequant scale mapping.
+
+    Casting raw fp8 codes to bf16 installs values in the fp8 *code*
+    range (±448 for e4m3) instead of true dequanted weights — the
+    historical fp8-range bug that silently poisoned probe/cost passes on
+    native-FP8 checkpoints. An unmapped fp8 tensor means the scale-map
+    scan missed it, so raise instead of guessing."""
+    if t.dtype not in _FLOAT8_DTYPES:
+        return
+    if _is_fp8_scaled_tensor(model_name, fp8_scale_inv_map):
+        return
+    if _allow_unscaled_fp8():
+        return
+    raise RuntimeError(
+        f"native-FP8 tensor {model_name!r} (dtype {t.dtype}) has no entry "
+        f"in fp8_scale_inv_map — casting raw fp8 codes to bf16 would "
+        f"install values in the code range (±448) instead of true "
+        f"dequanted weights (the historical fp8-range bug). The scale map "
+        f"is built by _build_fp8_scale_inv_map from `.weight_scale_inv` "
+        f"siblings (or the model profile's fp8_scale_pairs override, e.g. "
+        f"DSv4's `.scale` siblings); check the checkpoint's scale tensor "
+        f"naming against that scan. Set PRISMAQUANT_ALLOW_UNSCALED_FP8=1 "
+        f"only if this tensor is genuinely scale-free."
+    )
+
+
 def _apply_fp8_dequant_inplace(
     out: dict[str, torch.Tensor],
     fp8_scale_inv_map: dict[str, tuple[str, str]],
     device: torch.device,
 ) -> int:
     """For each tensor in `out` whose key matches a `fp8_scale_inv_map`
-    entry, read the scale_inv, apply the 128x128 block dequant, and
+    entry, read the scale_inv, apply the checkpoint-declared block
+    dequant (`fp8_scale_inv_map.block`, see `_fp8_dequant_block`), and
     replace the loaded tensor with the dequanted bf16 weight.
 
     Tensors and scales are both grouped by shape and multiplied in a
@@ -317,9 +488,11 @@ def _apply_fp8_dequant_inplace(
                 loaded_scales[model_name] = f.get_tensor(scale_key)
 
     # Step 2: Group matched weights by (out_dim, in_dim) shape. We only
-    # batch along exact-128-multiple shapes; odd-shaped tensors (rare)
-    # fall back to the per-tensor path.
-    block_r, block_c = 128, 128
+    # batch along exact-block-multiple shapes; odd-shaped tensors (rare)
+    # fall back to the per-tensor path. The block size is the
+    # checkpoint-declared quantization_config.weight_block_size carried
+    # on the map, never assumed.
+    block_r, block_c = _fp8_dequant_block(fp8_scale_inv_map)
     by_shape: dict[tuple[int, int], list[str]] = defaultdict(list)
     fallback: list[str] = []
     for name in loaded_scales:
@@ -328,6 +501,12 @@ def _apply_fp8_dequant_inplace(
             fallback.append(name)
             continue
         out_dim, in_dim = w.shape
+        # Hard shape assertion (audit §3.7a): a transposed scale grid is
+        # numel-compatible with the batched reshape below and would
+        # silently mis-scale every block.
+        _check_fp8_scale_grid(
+            name, tuple(w.shape), tuple(loaded_scales[name].shape),
+            (block_r, block_c))
         if out_dim % block_r != 0 or in_dim % block_c != 0:
             fallback.append(name)
             continue
@@ -368,7 +547,8 @@ def _apply_fp8_dequant_inplace(
     for name in fallback:
         w = out[name]
         scale_fp = loaded_scales[name].to(device=device)
-        out[name] = _dequant_fp8_block_weight(w, scale_fp)
+        out[name] = _dequant_fp8_block_weight(
+            w, scale_fp, block=(block_r, block_c), name=name)
         dequanted += 1
 
     return dequanted
@@ -407,6 +587,7 @@ def _materialize(model: nn.Module, prefixes: list[str],
         with f_ctx as f:
             for model_name, ckpt_name in pairs:
                 t = f.get_tensor(ckpt_name)
+                _require_fp8_scale(model_name, t, fp8_scale_inv_map)
                 if (t.is_floating_point()
                         and not _is_fp8_scaled_tensor(
                             model_name, fp8_scale_inv_map)):
@@ -426,7 +607,7 @@ def _materialize(model: nn.Module, prefixes: list[str],
 def _pack_per_expert_into_packed(
     out: dict[str, torch.Tensor],
     *,
-    per_expert_re: "re.Pattern",
+    is_per_expert,
     parent_for_projection,
     projection_names_for,
     live_param_shape,
@@ -456,7 +637,7 @@ def _pack_per_expert_into_packed(
     consumed: list[str] = []
     for key, t in out.items():
         name = key[:-len(".weight")] if key.endswith(".weight") else key
-        if not per_expert_re.match(name):
+        if not is_per_expert(name):
             continue
         head, proj = name.rsplit(".", 1)           # head = …experts.{idx}
         experts_path, idx_str = head.rsplit(".", 1)
@@ -528,9 +709,23 @@ def _build_expert_packer(model: nn.Module, weight_ckpt: dict[str, str]):
         return None
     pat = re.compile(regex[len("re:"):] if regex.startswith("re:") else regex)
 
+    # `out`/`weight_ckpt` keys are in HF checkpoint naming, but specs author
+    # `per_expert_regex` in whichever convention suits their export
+    # config_groups catch-all: text-only MoE specs use checkpoint naming
+    # (`^model.layers.*`), while multimodal specs use vLLM scheme-dispatch
+    # naming (`^language_model.model.layers.*`, a prefix swap from the on-disk
+    # `model.language_model.layers.*`). Match against the raw key OR its
+    # remap through the profile's own name remapper, so per-expert detection
+    # works under either convention with no architecture names here and no
+    # regression for checkpoint-named specs.
+    def _match_per_expert(name: str) -> bool:
+        if pat.match(name):
+            return True
+        return bool(pat.match(prof.to_vllm_internal_name(name)))
+
     def _is_per_expert(k: str) -> bool:
         name = k[:-len(".weight")] if k.endswith(".weight") else k
-        return bool(pat.match(name))
+        return _match_per_expert(name)
 
     if not any(_is_per_expert(k) for k in weight_ckpt):
         return None  # checkpoint already packed — nothing to do
@@ -544,13 +739,133 @@ def _build_expert_packer(model: nn.Module, weight_ckpt: dict[str, str]):
     def _packer(out):
         _pack_per_expert_into_packed(
             out,
-            per_expert_re=pat,
+            is_per_expert=_match_per_expert,
             parent_for_projection=prof.packed_expert_parent_for_projection,
             projection_names_for=prof.packed_expert_projection_names,
             live_param_shape=live_shapes.get,
         )
 
     return _packer
+
+
+def fill_packed_experts_from_source(
+    model: nn.Module,
+    source_model_path: str,
+    profile=None,
+    *,
+    progress: bool = False,
+) -> int:
+    """Fill zero-initialized packed-expert params from the source per-expert
+    safetensors.
+
+    Some architectures (e.g. Qwen3.5-MoE) have a text-only modeling class
+    (``qwen3_5_moe_text`` / ``…ForCausalLM``) that lacks the per-expert->packed
+    WeightsMapper the multimodal class provides. When a per-expert-on-disk
+    checkpoint is loaded through that text-only class (as the render/recache
+    calibration paths do after ``stage_text_only``), the packed params
+    (``…experts.gate_up_proj`` / ``…experts.down_proj``) load MISSING ->
+    newly-initialized (zero), silently breaking every activation-scale
+    calibration that depends on the routed-expert output.
+
+    This restores them by reading the per-expert source tensors and packing
+    them into the live params via the same tested bridge
+    (``_pack_per_expert_into_packed``). Idempotent and safe:
+
+      * no-op when the checkpoint is already packed, the live module is
+        per-expert, or the packed params already carry non-zero weights
+        (so it never touches a correctly-loaded model);
+      * every structural decision comes from the model profile — no
+        architecture names here.
+
+    Returns the number of packed params filled. Call right after
+    ``from_pretrained`` on the calibration model.
+    """
+    try:
+        from .model_profiles import profile_from_model
+        prof = profile or profile_from_model(model)
+    except Exception:
+        return 0
+    # Local import: sensitivity_probe imports from this module, so import the
+    # packed-experts detector lazily to avoid a circular import at module load.
+    from .sensitivity_probe import _is_packed_experts_module
+    packed_names = prof.packed_expert_param_names()
+    regex = prof.per_expert_moe_regex()
+    if not packed_names or not regex:
+        return 0
+    pat = re.compile(regex[len("re:"):] if regex.startswith("re:") else regex)
+
+    def _is_per_expert(name: str) -> bool:
+        if pat.match(name):
+            return True
+        return bool(pat.match(prof.to_vllm_internal_name(name)))
+
+    src = Path(source_model_path)
+    idx_path = src / "model.safetensors.index.json"
+    if not idx_path.exists():
+        return 0
+    import json as _json
+    weight_map = _json.loads(idx_path.read_text())["weight_map"]
+
+    filled = 0
+    for qname, mod in model.named_modules():
+        if not _is_packed_experts_module(mod, prof):
+            continue
+        # Skip when already populated — never disturb a correct load.
+        live_params = {
+            pn: getattr(mod, pn) for pn in packed_names if hasattr(mod, pn)
+        }
+        if not live_params:
+            continue
+        any_pname = next(iter(live_params))
+        p0 = live_params[any_pname]
+        if p0.is_meta:
+            continue
+        if float(p0.detach().abs().max().item()) > 0.0:
+            continue  # already loaded non-zero
+
+        # Source prefix for this module's per-expert tensors.
+        src_prefix = prof.source_tensor_name(qname)
+        out: dict[str, torch.Tensor] = {}
+        by_shard: dict[str, list[str]] = defaultdict(list)
+        for k in weight_map:
+            if not k.startswith(src_prefix + "."):
+                continue
+            name = k[:-len(".weight")] if k.endswith(".weight") else k
+            if _is_per_expert(name):
+                by_shard[weight_map[k]].append(k)
+        if not by_shard:
+            continue
+        target_dtype = p0.dtype
+        for shard, keys in by_shard.items():
+            with safe_open(str(src / shard), framework="pt") as f:
+                for k in keys:
+                    out[k] = f.get_tensor(k).to(target_dtype)
+        live_shapes = {
+            f"{src_prefix}.{pn}": tuple(p.shape)
+            for pn, p in live_params.items()
+        }
+        n = _pack_per_expert_into_packed(
+            out,
+            is_per_expert=_is_per_expert,
+            parent_for_projection=prof.packed_expert_parent_for_projection,
+            projection_names_for=prof.packed_expert_projection_names,
+            live_param_shape=live_shapes.get,
+        )
+        if n == 0:
+            continue
+        for pn, p in live_params.items():
+            packed_key = f"{src_prefix}.{pn}"
+            t = out.get(packed_key)
+            if t is None:
+                continue
+            with torch.no_grad():
+                p.data.copy_(t.to(device=p.device, dtype=p.dtype))
+            filled += 1
+        del out
+    if progress and filled:
+        print(f"[fill-experts] filled {filled} packed-expert params from source "
+              f"(text-only load left them zero-initialized)", flush=True)
+    return filled
 
 
 def _read_layer_to_device(prefix: str,
@@ -587,6 +902,7 @@ def _read_layer_to_device(prefix: str,
         with f_ctx as f:
             for model_name, ckpt_name in pairs:
                 t = f.get_tensor(ckpt_name)
+                _require_fp8_scale(model_name, t, fp8_scale_inv_map)
                 if (t.is_floating_point()
                         and not _is_fp8_scaled_tensor(
                             model_name, fp8_scale_inv_map)):
@@ -1152,6 +1468,14 @@ def _embed_prefix(base_model: nn.Module, full_path: str) -> str:
     return f"{full_path}.embed_tokens." if full_path else "embed_tokens."
 
 
+def _layer_attention_type(layer: nn.Module):
+    return (
+        getattr(layer, "layer_type", None)
+        or getattr(getattr(layer, "self_attn", None), "layer_type", None)
+        or getattr(getattr(layer, "attention", None), "layer_type", None)
+    )
+
+
 def _call_layer(layer: nn.Module, hidden: torch.Tensor, *,
                 position_embeddings, attention_mask, position_ids,
                 past_key_values=None, **extra) -> torch.Tensor:
@@ -1167,21 +1491,37 @@ def _call_layer(layer: nn.Module, hidden: torch.Tensor, *,
     by `_compute_position_embeddings` for multi-layer-type-rope models like
     Gemma3/Gemma4), select this layer's entry via its attention `layer_type`
     so sliding- and full-attention layers each get their own rope.
+
+    When `attention_mask` is a `{layer_type: mask}` dict, select by the same
+    layer type. This mirrors Gemma3/Gemma4 HF forwards, where sliding-window
+    and full-attention layers receive different masks.
     """
+    lt = None
     pe = position_embeddings
     if isinstance(pe, dict):
-        lt = (getattr(layer, "layer_type", None)
-              or getattr(getattr(layer, "self_attn", None), "layer_type", None)
-              or getattr(getattr(layer, "attention", None), "layer_type", None))
+        lt = _layer_attention_type(layer)
         pe = pe.get(lt)
         if pe is None:
-            # Unknown/missing layer_type — fall back to any entry rather than
-            # crash (single-type rope, or a layer that doesn't tag its type).
-            # `None` default guards against an empty dict (StopIteration).
-            pe = next(iter(position_embeddings.values()), None)
+            if len(position_embeddings) == 1:
+                pe = next(iter(position_embeddings.values()))
+            else:
+                raise RuntimeError(
+                    "per-layer position_embeddings requires a known "
+                    f"layer_type; got {lt!r} for {layer.__class__.__name__}"
+                )
+    am = attention_mask
+    if isinstance(am, dict):
+        if lt is None:
+            lt = _layer_attention_type(layer)
+        if lt not in am:
+            raise RuntimeError(
+                "per-layer attention mask requires a known layer_type; "
+                f"got {lt!r} for {layer.__class__.__name__}"
+            )
+        am = am[lt]
     out = layer(
         hidden_states=hidden,
-        attention_mask=attention_mask,
+        attention_mask=am,
         position_ids=position_ids,
         past_key_values=past_key_values,
         use_cache=False,
@@ -1230,6 +1570,68 @@ def _make_causal_mask(seqlen: int, device: torch.device, dtype: torch.dtype):
     mask = torch.full((seqlen, seqlen), float("-inf"), device=device, dtype=dtype)
     mask = torch.triu(mask, diagonal=1)
     return mask.unsqueeze(0).unsqueeze(0)
+
+
+def _compute_attention_mask(
+    base_model: nn.Module,
+    hidden: torch.Tensor,
+    position_ids: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+    past_key_values=None,
+):
+    """Return the streaming attention mask for a full forward pass.
+
+    Most models use one full causal mask. Gemma3/Gemma4-style hybrid models
+    declare ``config.layer_types`` with both ``full_attention`` and
+    ``sliding_attention``; those must receive the same per-type mask mapping
+    that HuggingFace's model.forward builds.
+    """
+    cfg = getattr(base_model, "config", None)
+    layer_types = tuple(getattr(cfg, "layer_types", ()) or ())
+    if cfg is None or "sliding_attention" not in layer_types:
+        return _make_causal_mask(hidden.size(1), hidden.device, hidden.dtype)
+
+    try:
+        from transformers.masking_utils import (
+            create_causal_mask,
+            create_sliding_window_causal_mask,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "sliding-window layer_types require transformers masking_utils"
+        ) from exc
+
+    mask_kwargs = {
+        "config": cfg,
+        "inputs_embeds": hidden,
+        "attention_mask": attention_mask,
+        "past_key_values": past_key_values,
+        "position_ids": position_ids,
+    }
+    sliding_mask_kwargs = dict(mask_kwargs)
+    if getattr(cfg, "use_bidirectional_attention", False):
+        try:
+            from transformers.models.gemma3.modeling_gemma3 import (
+                _bidirectional_window_overlay,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Gemma3 bidirectional sliding masks require the Gemma3 "
+                "transformers masking helper"
+            ) from exc
+        mask_kwargs["or_mask_function"] = (
+            lambda *args: torch.tensor(True, dtype=torch.bool)
+        )
+        sliding_mask_kwargs["or_mask_function"] = _bidirectional_window_overlay(
+            cfg.sliding_window
+        )
+
+    return {
+        "full_attention": create_causal_mask(**mask_kwargs),
+        "sliding_attention": create_sliding_window_causal_mask(
+            **sliding_mask_kwargs
+        ),
+    }
 
 
 def _resolve_base_prefix(root: nn.Module, base: nn.Module) -> str:

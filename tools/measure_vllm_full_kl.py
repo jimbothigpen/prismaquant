@@ -5,14 +5,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import time
 from pathlib import Path
 
 import torch
-from datasets import load_dataset
-from transformers import AutoTokenizer
-from vllm import LLM, SamplingParams
+
+# vLLM / datasets / transformers are imported lazily inside the functions
+# that need them so the position-KL math stays unit-testable in environments
+# without a serving stack.
 
 
 def _load_wikitext_calibration(
@@ -21,7 +23,10 @@ def _load_wikitext_calibration(
     cache_dir: str,
     n_samples: int,
     seqlen: int,
+    window_seed: int = 42,
 ) -> tuple[list[list[int]], list[int], int]:
+    from datasets import load_dataset
+
     ds = load_dataset(
         "wikitext",
         "wikitext-2-raw-v1",
@@ -37,7 +42,7 @@ def _load_wikitext_calibration(
     if int(ids.numel()) < seqlen + 1:
         raise RuntimeError(f"not enough calibration tokens: {int(ids.numel())}")
     max_start = int(ids.numel()) - int(seqlen)
-    rng = random.Random(42)
+    rng = random.Random(window_seed)
     if max_start >= n_samples:
         starts = rng.sample(range(max_start), n_samples)
     else:
@@ -49,7 +54,9 @@ def _load_wikitext_calibration(
     return calib, starts, int(ids.numel())
 
 
-def _load_llm(args, *, max_model_len: int) -> LLM:
+def _load_llm(args, *, max_model_len: int) -> "LLM":
+    from vllm import LLM
+
     kwargs = {
         "model": args.model,
         "trust_remote_code": True,
@@ -64,6 +71,11 @@ def _load_llm(args, *, max_model_len: int) -> LLM:
     }
     if args.quantization:
         kwargs["quantization"] = args.quantization
+    if args.max_num_batched_tokens is not None:
+        # Mamba/DeltaNet hybrids (e.g. Qwen3.6-35B-A3B) require
+        # max_num_batched_tokens >= their chunk-alignment floor (~2096);
+        # the seqlen+16 max_model_len alone can drive it below that.
+        kwargs["max_num_batched_tokens"] = args.max_num_batched_tokens
     return LLM(**kwargs)
 
 
@@ -95,32 +107,53 @@ def _logprob_vector(logprobs, *, vocab_size: int) -> torch.Tensor:
     if missing:
         raise RuntimeError(
             f"vLLM returned {vocab_size - missing}/{vocab_size} logprobs; "
-            "full-vocab KL requires logprobs=-1 support"
+            "full-vocab KL requires the engine to return every token logprob"
         )
     return vec
 
 
 def _measure_logprobs(
-    llm: LLM,
+    llm: "LLM",
     prompts: list[list[int]],
     *,
     vocab_size: int,
 ) -> torch.Tensor:
-    params = SamplingParams(
-        max_tokens=1,
-        temperature=0.0,
-        logprobs=-1,
-        detokenize=False,
-    )
+    from vllm import SamplingParams
+
+    # logprobs=-1 (full vocab) is the primary request, but some
+    # model/vLLM combinations (observed: Qwen3-4B on vllm 0.21.1rc1)
+    # silently return an EMPTY logprobs list for -1 — for those, retry
+    # with an explicit vocab-size count. The reverse also exists: with
+    # an explicit count some engines OMIT -inf (padding) tokens
+    # (observed: Qwen3.6-35B-A3B, 243 entries short), so -1 must stay
+    # the first choice. _logprob_vector's completeness check guards
+    # whichever path produced the row.
+    def _params(logprob_arg: int) -> SamplingParams:
+        return SamplingParams(
+            max_tokens=1,
+            temperature=0.0,
+            logprobs=logprob_arg,
+            detokenize=False,
+        )
+
     rows = []
     for index, prompt_ids in enumerate(prompts, 1):
         start = time.monotonic()
-        output = llm.generate(
-            [{"prompt_token_ids": prompt_ids}],
-            params,
-            use_tqdm=False,
-        )[0]
-        logprobs = output.outputs[0].logprobs[0]
+        logprobs = None
+        for logprob_arg in (-1, int(vocab_size)):
+            output = llm.generate(
+                [{"prompt_token_ids": prompt_ids}],
+                _params(logprob_arg),
+                use_tqdm=False,
+            )[0]
+            got = output.outputs[0].logprobs
+            if got and len(got) and len(got[0]):
+                logprobs = got[0]
+                break
+        if logprobs is None:
+            raise RuntimeError(
+                "vLLM returned no logprobs under either logprobs=-1 or "
+                f"logprobs={vocab_size}")
         rows.append(_logprob_vector(logprobs, vocab_size=vocab_size))
         print(
             f"[kl] sample {index}/{len(prompts)} "
@@ -130,7 +163,67 @@ def _measure_logprobs(
     return torch.stack(rows, dim=0).contiguous()
 
 
+def _measure_prompt_topk(
+    llm: "LLM",
+    prompts: list[list[int]],
+    *,
+    top_k: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """All-position scoring: per prompt position, the top-K token ids and
+    logprobs of the model's next-token distribution (vLLM prompt_logprobs).
+
+    Returns (ids, lps) shaped [n_prompts, P-1, K] (position 0 has no
+    prediction). Full-vocab dicts at every position are infeasible (~620M
+    Python objects per pass), so K bounds the support; the tail is handled
+    as a single bucket by the caller. K=1024 covers ~all teacher mass at
+    nearly every position and the truncation floor is shared across arms.
+    Positions with fewer than K entries are padded with ``(-1, -inf)``;
+    ``_position_kl`` masks the pads back out.
+    """
+    from vllm import SamplingParams
+
+    params = SamplingParams(
+        max_tokens=1,
+        temperature=0.0,
+        prompt_logprobs=int(top_k),
+        detokenize=False,
+    )
+    all_ids, all_lps = [], []
+    for index, prompt_ids in enumerate(prompts, 1):
+        start = time.monotonic()
+        output = llm.generate(
+            [{"prompt_token_ids": prompt_ids}],
+            params,
+            use_tqdm=False,
+        )[0]
+        plps = output.prompt_logprobs
+        if plps is None:
+            raise RuntimeError("vLLM did not return prompt_logprobs")
+        ids_rows, lps_rows = [], []
+        for pos in range(1, len(prompt_ids)):
+            d = plps[pos]
+            items = [(int(k), float(getattr(v, "logprob", v)))
+                     for k, v in d.items()]
+            items.sort(key=lambda kv: kv[1], reverse=True)
+            items = items[: int(top_k)]
+            if len(items) < int(top_k):
+                pad = int(top_k) - len(items)
+                items = items + [(-1, float("-inf"))] * pad
+            ids_rows.append([kv[0] for kv in items])
+            lps_rows.append([kv[1] for kv in items])
+        all_ids.append(torch.tensor(ids_rows, dtype=torch.int32))
+        all_lps.append(torch.tensor(lps_rows, dtype=torch.float32))
+        print(
+            f"[kl] sample {index}/{len(prompts)} positions={len(ids_rows)} "
+            f"top_k={top_k} wall={time.monotonic() - start:.2f}s",
+            flush=True,
+        )
+    return torch.stack(all_ids), torch.stack(all_lps)
+
+
 def _teacher(args) -> int:
+    from transformers import AutoTokenizer
+
     started = time.monotonic()
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -140,6 +233,7 @@ def _teacher(args) -> int:
         cache_dir=args.dataset_cache_dir,
         n_samples=args.n_samples,
         seqlen=args.seqlen,
+        window_seed=args.window_seed,
     )
     print(
         f"[kl] teacher model={args.model} n={args.n_samples} "
@@ -154,6 +248,46 @@ def _teacher(args) -> int:
             f"model vocab_size={vocab_size}; full-vocab KL requires "
             "requesting at least the full vocabulary"
         )
+    if args.score_positions == "all":
+        topk_ids, topk_lps = _measure_prompt_topk(
+            llm, prompts, top_k=args.prompt_top_k)
+        payload = {
+            "score_positions": "all",
+            "prompt_top_k": int(args.prompt_top_k),
+            "topk_ids": topk_ids,
+            # fp32, matching the student side: fp16 teacher logprobs against
+            # fp32 student logprobs is an asymmetric rounding that biases the
+            # absolute confident-KL (mostly cancels in paired A/Bs, but the
+            # published absolute numbers come through here too).
+            "topk_lps": topk_lps.to(torch.float32),
+            "calib_ids": torch.tensor(prompts, dtype=torch.long),
+            "starts": starts,
+            "model": args.model,
+            "n_samples": int(args.n_samples),
+            "seqlen": int(args.seqlen),
+            "vocab_size": int(vocab_size),
+        }
+        torch.save(payload, output)
+        cov = topk_lps.double().exp().sum(dim=-1)
+        meta = {
+            "mode": "teacher",
+            "score_positions": "all",
+            "prompt_top_k": int(args.prompt_top_k),
+            "model": args.model,
+            "output": str(output),
+            "n_samples": int(args.n_samples),
+            "seqlen": int(args.seqlen),
+            "starts": starts,
+            "total_tokens": total_tokens,
+            "vocab_size": int(vocab_size),
+            "teacher_shape": list(topk_lps.shape),
+            "topk_coverage_mean": float(cov.mean()),
+            "topk_coverage_min": float(cov.min()),
+            "elapsed_s": time.monotonic() - started,
+        }
+        Path(args.meta_output).write_text(json.dumps(meta, indent=2))
+        print(json.dumps(meta, indent=2), flush=True)
+        return 0
     logprobs = _measure_logprobs(llm, prompts, vocab_size=vocab_size)
     payload = {
         "teacher_logprobs": logprobs,
@@ -182,9 +316,106 @@ def _teacher(args) -> int:
     return 0
 
 
+def _position_kl(t_ids_row, t_lps_row, s_ids_row, s_lps_row) -> tuple[float, float]:
+    """KL(teacher || student) over one position's top-K support + tail bucket.
+
+    Returns ``(kl, teacher_top1_prob)``. Pad entries (id ``-1`` / ``-inf``
+    logprob, emitted when a position carries fewer than K entries) are masked
+    out of both the KL sum and the accounted probability mass: an unmasked pad
+    produces ``0 * (-inf) = NaN`` and poisons the whole run's mean, and a pad
+    mapped to the student floor would wrongly consume student mass from the
+    tail bucket. Entries with exactly zero teacher probability contribute
+    zero KL and zero mass, so masking them is exact, not an approximation.
+
+    The student-floor substitution and the 1e-12 tail clamps are the
+    documented relative-compare-only convention (shared across arms); they
+    are deliberately left as-is.
+    """
+    smap = {
+        int(a): float(b)
+        for a, b in zip(s_ids_row.tolist(), s_lps_row.tolist())
+        if int(a) >= 0 and math.isfinite(float(b))
+    }
+    if not smap:
+        raise RuntimeError("student position carries no finite top-K entries")
+    floor = min(smap.values())                        # kl_ab.py convention
+    valid = [
+        (int(t), float(lp))
+        for t, lp in zip(t_ids_row.tolist(), t_lps_row.tolist())
+        if int(t) >= 0 and math.isfinite(float(lp))
+    ]
+    if not valid:
+        raise RuntimeError("teacher position carries no finite top-K entries")
+    tlp = torch.tensor([lp for _t, lp in valid], dtype=torch.float64)
+    q = torch.tensor([smap.get(t, floor) for t, _lp in valid],
+                     dtype=torch.float64)
+    p = tlp.exp()
+    kl = float((p * (tlp - q)).sum())
+    # tail bucket: remaining teacher mass vs remaining student mass
+    pt = max(1.0 - float(p.sum()), 1e-12)
+    qt = max(1.0 - float(q.exp().sum()), 1e-12)
+    kl += pt * (math.log(pt) - math.log(qt))
+    return kl, float(p.max())
+
+
+def _student_all_positions(args, payload) -> int:
+    started = time.monotonic()
+    prompts = payload["calib_ids"].tolist()
+    vocab_size = int(payload["vocab_size"])
+    top_k = int(payload["prompt_top_k"])
+    t_ids = payload["topk_ids"]                       # [n, P-1, K]
+    t_lps = payload["topk_lps"].float()
+    print(
+        f"[kl] student(all-pos) model={args.model} n={len(prompts)} "
+        f"seqlen={int(payload['seqlen'])} top_k={top_k}",
+        flush=True,
+    )
+    llm = _load_llm(args, max_model_len=int(payload["seqlen"]) + 16)
+    s_ids, s_lps = _measure_prompt_topk(llm, prompts, top_k=top_k)
+
+    n, pm1, k = t_ids.shape
+    kl_pos = torch.zeros((n, pm1), dtype=torch.float64)
+    t_top1 = torch.zeros((n, pm1), dtype=torch.float64)
+    for i in range(n):
+        for j in range(pm1):
+            kl, top1 = _position_kl(
+                t_ids[i, j], t_lps[i, j], s_ids[i, j], s_lps[i, j],
+            )
+            kl_pos[i, j] = kl
+            t_top1[i, j] = top1
+    confident = t_top1 > 0.5
+    flat = kl_pos.flatten()
+    result = {
+        "mode": "student",
+        "score_positions": "all",
+        "prompt_top_k": top_k,
+        "model": args.model,
+        "teacher_model": payload.get("model"),
+        "teacher_payload": str(args.teacher_payload),
+        "quantization": args.quantization,
+        "n_samples": len(prompts),
+        "seqlen": int(payload["seqlen"]),
+        "vocab_size": vocab_size,
+        "n_positions": int(flat.numel()),
+        "kl_mean": float(flat.mean()),
+        "kl_p99": float(flat.quantile(0.99)),
+        "kl_max": float(flat.max()),
+        "kl_confident_mean": float(kl_pos[confident].mean())
+        if bool(confident.any()) else None,
+        "n_confident": int(confident.sum()),
+        "kl_per_sample": [float(x) for x in kl_pos.mean(dim=1).tolist()],
+        "elapsed_s": time.monotonic() - started,
+    }
+    Path(args.output).write_text(json.dumps(result, indent=2))
+    print(json.dumps(result, indent=2), flush=True)
+    return 0
+
+
 def _student(args) -> int:
     started = time.monotonic()
     payload = torch.load(args.teacher_payload, map_location="cpu")
+    if payload.get("score_positions") == "all":
+        return _student_all_positions(args, payload)
     teacher = payload["teacher_logprobs"].float()
     prompts = payload["calib_ids"].tolist()
     vocab_size = int(payload["vocab_size"])
@@ -233,7 +464,18 @@ def main() -> int:
     parser.add_argument("--quantization")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.84)
     parser.add_argument("--max-logprobs", type=int, default=248320)
+    parser.add_argument(
+        "--score-positions", choices=["final", "all"], default="final",
+        help="final: full-vocab KL at the window-final context only "
+        "(legacy; n_positions = n_samples). all: top-K KL at every prompt "
+        "position (n_positions = n_samples*(seqlen-1)).")
+    parser.add_argument("--prompt-top-k", type=int, default=1024)
     parser.add_argument("--enforce-eager", action="store_true")
+    parser.add_argument("--max-num-batched-tokens", type=int, default=None)
+    parser.add_argument(
+        "--window-seed", type=int, default=42,
+        help="RNG seed for the WikiText window draw (teacher mode only; "
+        "students replay the windows stored in the teacher payload)")
     args = parser.parse_args()
     if args.mode == "student" and not args.teacher_payload:
         parser.error("--teacher-payload is required in student mode")

@@ -85,6 +85,8 @@ def validate_artifact(
     n_mmlu_questions: int = 200,
     calib_seqlen: int = 512,
     calib_n_samples: int = 8,
+    calib_split: str = "test",
+    calib_seed: int = 42,
     progress: bool = True,
     _metric_backend: Callable[..., Mapping[str, Any]] | None = None,
 ) -> dict:
@@ -108,6 +110,8 @@ def validate_artifact(
             n_mmlu_questions=int(n_mmlu_questions),
             calib_seqlen=int(calib_seqlen),
             calib_n_samples=int(calib_n_samples),
+            calib_split=str(calib_split),
+            calib_seed=int(calib_seed),
             progress=bool(progress),
         )
     )
@@ -140,6 +144,12 @@ def validate_artifact(
     metrics["model_sha"] = _sha256_model_reference(model_path)
     metrics["layer_config_sha"] = config_sha
     metrics["eval_seconds"] = float(time.monotonic() - started)
+    # Metric-era marker (QC on review-batch): the end-KL eval split moved
+    # from wikitext TRAIN to TEST on 2026-06-12 — pre-marker registry
+    # records were measured on train and are NOT comparable at face value.
+    # Records without 'eval_split' are the train era.
+    metrics["eval_split"] = "test"
+    metrics["metric_era"] = "2026-06-12-test-split"
     return metrics
 
 
@@ -175,6 +185,8 @@ def _compute_metrics(
     n_mmlu_questions: int,
     calib_seqlen: int,
     calib_n_samples: int,
+    calib_split: str,
+    calib_seed: int,
     progress: bool,
 ) -> dict:
     try:
@@ -245,6 +257,8 @@ def _compute_metrics(
                 device=torch_device,
                 calib_seqlen=calib_seqlen,
                 calib_n_samples=calib_n_samples,
+                calib_split=calib_split,
+                calib_seed=calib_seed,
                 cal_hash=cal_hash,
                 progress=progress,
             )
@@ -369,29 +383,36 @@ def _wikitext_ppl(
     if seq_len < 2:
         raise ValueError("WikiText tokenization produced fewer than two tokens")
 
-    max_stride = 2048
-    raw_stride = os.environ.get("PRISMAQUANT_VALIDATION_WIKITEXT_STRIDE")
-    if raw_stride:
+    # Chunked (non-overlapping-window) PPL: the token stream is split into
+    # disjoint windows and each window is scored independently, so the first
+    # token of every window sees no context from the previous window. This is
+    # deliberately NOT strided/sliding-window evaluation. The env knob keeps
+    # its historical name for compatibility but sets the window (chunk) size.
+    max_window = 2048
+    raw_window = os.environ.get("PRISMAQUANT_VALIDATION_WIKITEXT_STRIDE")
+    if raw_window:
         try:
-            max_stride = max(2, int(raw_stride))
+            max_window = max(2, int(raw_window))
         except ValueError as exc:
             raise ValueError(
                 "PRISMAQUANT_VALIDATION_WIKITEXT_STRIDE must be an integer"
             ) from exc
-    stride = min(_model_context_length(model, tokenizer), max_stride, seq_len)
-    stride = max(int(stride), 2)
+    window_len = min(_model_context_length(model, tokenizer), max_window, seq_len)
+    window_len = max(int(window_len), 2)
     nll_sum = 0.0
     token_count = 0
-    prev_end = 0
-    starts = range(0, seq_len, stride)
+    starts = range(0, seq_len, window_len)
     for begin in _progress_iter(starts, progress, "wikitext-ppl"):
-        end = min(begin + stride, seq_len)
-        trg_len = end - prev_end
+        end = min(begin + window_len, seq_len)
         window = input_ids[:, begin:end].to(device)
         if window.size(1) < 2:
-            break
+            break  # a 1-token remainder window has no prediction targets
         labels = window.clone()
-        labels[:, :-trg_len] = -100
+        # The HF causal-LM loss is the mean NLL over the window's shifted
+        # targets — (L - 1) of them, the first token has no prediction.
+        # Weight each window by that true target count so the remainder
+        # window is not overweighted by L / (L - 1).
+        n_targets = int(window.size(1)) - 1
 
         def _loss_forward(input_ids, target_labels):
             return model(input_ids, labels=target_labels).loss
@@ -405,9 +426,8 @@ def _wikitext_ppl(
             window,
             labels,
         )
-        nll_sum += float(loss.detach().float().item()) * float(trg_len)
-        token_count += int(trg_len)
-        prev_end = end
+        nll_sum += float(loss.detach().float().item()) * float(n_targets)
+        token_count += int(n_targets)
         del loss, labels, window
         if getattr(device, "type", None) == "cuda":
             import gc
@@ -643,6 +663,8 @@ def _end_kl(
     device,
     calib_seqlen: int,
     calib_n_samples: int,
+    calib_split: str,
+    calib_seed: int,
     cal_hash: str,
     progress: bool,
 ) -> float:
@@ -659,6 +681,8 @@ def _end_kl(
         cache_dir=cache_dir,
         n_samples=int(calib_n_samples),
         seqlen=int(calib_seqlen),
+        split=str(calib_split),
+        seed=int(calib_seed),
     )
     ref_log_probs = []
     for i in _progress_iter(range(calib_ids.size(0)), progress, "end-kl-ref"):
@@ -685,6 +709,13 @@ def _end_kl(
             calib_ids,
             ref_log_probs,
             work_root=work_root,
+            # The reference above is built at the last token only
+            # (logits[:, -1:, :]); the KL scope MUST match it. Left
+            # unspecified, the scope resolves from PRISMAQUANT_FULL_SEQUENCE_KL
+            # and a [1,1,V] teacher silently broadcasts against [1,T,V]
+            # student log-probs (audit M7). measure_assignment_kl also
+            # hard-fails on any teacher/student shape mismatch now.
+            kl_scope="last_token",
         )
     )
 
@@ -696,6 +727,8 @@ def _fixed_calib_ids(
     cache_dir: Path,
     n_samples: int,
     seqlen: int,
+    split: str = "test",
+    seed: int = 42,
 ):
     import torch
 
@@ -703,14 +736,14 @@ def _fixed_calib_ids(
         tokenizer,
         load_dataset,
         cache_dir=cache_dir,
-        split="train",
+        split=split,
         n_tokens=None,
     )[0]
     if int(ids.numel()) < seqlen + 1:
         repeats = math.ceil((seqlen + 1) / max(int(ids.numel()), 1))
         ids = ids.repeat(repeats)
     max_start = max(int(ids.numel()) - int(seqlen), 0)
-    rng = random.Random(42)
+    rng = random.Random(int(seed))
     if max_start >= n_samples:
         starts = rng.sample(range(max_start), n_samples)
     else:
@@ -881,6 +914,8 @@ def _main_validate(argv: list[str]) -> int:
     ap.add_argument("--n-mmlu-questions", type=int, default=200)
     ap.add_argument("--calib-seqlen", type=int, default=512)
     ap.add_argument("--calib-n-samples", type=int, default=8)
+    ap.add_argument("--calib-split", default="test")
+    ap.add_argument("--calib-seed", type=int, default=42)
     ap.add_argument("--progress", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--register", action="store_true")
     ap.add_argument("--registry", default=str(DEFAULT_REGISTRY_PATH))
@@ -900,6 +935,8 @@ def _main_validate(argv: list[str]) -> int:
         n_mmlu_questions=args.n_mmlu_questions,
         calib_seqlen=args.calib_seqlen,
         calib_n_samples=args.calib_n_samples,
+        calib_split=args.calib_split,
+        calib_seed=args.calib_seed,
         progress=args.progress,
     )
     output = dict(metrics)
@@ -933,6 +970,8 @@ def _main_validate(argv: list[str]) -> int:
                 "n_mmlu_questions": args.n_mmlu_questions,
                 "calib_seqlen": args.calib_seqlen,
                 "calib_n_samples": args.calib_n_samples,
+                "calib_split": args.calib_split,
+                "calib_seed": args.calib_seed,
                 "device": args.device,
                 "dtype": args.dtype,
             },

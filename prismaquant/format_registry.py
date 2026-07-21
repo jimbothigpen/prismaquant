@@ -32,6 +32,7 @@ from prismaquant.fp8_dynamic import (
     fp8_dynamic_activation_qdq_vllm,
     fp8_dynamic_weight_qdq,
 )
+from prismaquant.gguf_formats import make_gguf_qdq
 from prismaquant.mx_formats import (
     e8m0_to_scale,
     mxfp8_e4m3_activation_qdq_vllm,
@@ -307,7 +308,10 @@ def _e3m2_codebook() -> torch.Tensor:
     codes = set([0.0])
     for exp in range(8):
         for m in range(4):
-            val = (1 + m / 4) * (2 ** (exp - 3))
+            if exp == 0:
+                val = (m / 4) * (2 ** -2)
+            else:
+                val = (1 + m / 4) * (2 ** (exp - 3))
             codes.add(+val); codes.add(-val)
     return torch.tensor(sorted(codes), dtype=torch.float32)
 
@@ -317,7 +321,10 @@ def _e2m3_codebook() -> torch.Tensor:
     codes = set([0.0])
     for exp in range(4):
         for m in range(8):
-            val = (1 + m / 8) * (2 ** (exp - 1))
+            if exp == 0:
+                val = (m / 8) * (2 ** 0)
+            else:
+                val = (1 + m / 8) * (2 ** (exp - 1))
             codes.add(+val); codes.add(-val)
     return torch.tensor(sorted(codes), dtype=torch.float32)
 
@@ -341,7 +348,7 @@ def _e4m3_codebook() -> torch.Tensor:
 def _e5m2_codebook() -> torch.Tensor:
     # 8-bit FP e5m2. Wider range, less mantissa precision.
     codes = set([0.0])
-    for exp in range(32):
+    for exp in range(31):
         for m in range(4):
             if exp == 0:
                 val = (m / 4) * (2 ** -14)
@@ -400,10 +407,14 @@ def _make_rtn(codebook_name: str, group_size: int, mx_scale: bool = False):
     The hot path is wrapped in ``torch.compile`` (mode='reduce-overhead',
     dynamic=False) by default — micro-benchmark on Blackwell + cu130 +
     torch 2.11 shows ~10x speedup on per-Linear activation RTN
-    (12 ms eager → 1.2 ms compiled, max numerical diff 5e-7).  This
-    matters most on the polish hot path where the closure is called
-    once per Linear per forward, ~497 calls per measurement on 27B,
-    several hundred measurements per polish pass.
+    (12 ms eager → 1.2 ms compiled).  Compiled-vs-eager is MSE-identical
+    but NOT bit-identical: at exact codebook midpoints Inductor fusion
+    can flip the tie (~0.036% of bf16 elements pick the other equidistant
+    code), so screens that require bit-reproducibility across the
+    compiled/eager boundary must pin one path.  This matters most on the
+    polish hot path where the closure is called once per Linear per
+    forward, ~497 calls per measurement on 27B, several hundred
+    measurements per polish pass.
 
     Set ``PRISMAQUANT_DISABLE_RTN_COMPILE=1`` to fall back to eager —
     only useful if torch.compile fails on a particular tensor shape
@@ -584,6 +595,36 @@ def _plain_fp8_autoround(elt="fp8_e4m3", act_bits=8):
     )
 
 
+def _nvfp4_export_aligned_rtn(x: torch.Tensor) -> torch.Tensor:
+    """NVFP4 WEIGHT RTN matching the export/compressed-tensors convention.
+
+    Routes through the export codec so registry weight emulation and the
+    shipped bytes share one rendering (the resident-vs-served mismatch
+    class). Last dims that are not a multiple of the group size are
+    zero-padded then sliced back — zeros cannot perturb a max-abs group
+    scale, so padding is exact for the real columns.
+
+    WEIGHTS ONLY: the export codec derives a per-tensor global scale from
+    the tensor it is given; for activations that would make the emulation
+    batch-dependent, while serve-time activation quantization uses a
+    STATIC input_global_scale fit at calibration. Activation emulation
+    stays on the per-group dynamic RTN (see the registration below) until
+    a static-scale-aware emulation exists.
+    """
+    from . import export_native_compressed as enc
+
+    orig_shape = x.shape
+    in_features = int(orig_shape[-1])
+    flat = x.reshape(-1, in_features).to(torch.float32)
+    pad = (-in_features) % 16
+    if pad:
+        flat = torch.nn.functional.pad(flat, (0, pad))
+    out = enc._rtn_dequant_nvfp4(flat, group_size=16)
+    if pad:
+        out = out[:, :in_features]
+    return out.reshape(orig_shape).to(x.dtype)
+
+
 # NVFP4 / NVFP4A16  (NVIDIA, group_size=16, FP8 scales)
 register_format(FormatSpec(
     name="NVFP4",
@@ -591,7 +632,9 @@ register_format(FormatSpec(
     weight_element_dtype="fp4_e2m1", act_bits=4, act_dtype_name="fp4_e2m1",
     act_group_size=16, family="nv", min_capability_sm=100,
     autoround_config=lambda: _nv_autoround(4, 16, 4),
-    quantize_dequantize=_make_rtn("fp4_e2m1", 16),
+    quantize_dequantize=_nvfp4_export_aligned_rtn,
+    # activations: per-group dynamic RTN, NOT the export codec — see
+    # _nvfp4_export_aligned_rtn docstring (batch-dependence).
     activation_quantize_dequantize=_make_rtn("fp4_e2m1", 16),
 ))
 register_format(FormatSpec(
@@ -600,7 +643,7 @@ register_format(FormatSpec(
     weight_element_dtype="fp4_e2m1", act_bits=None,
     family="nv", min_capability_sm=100,
     autoround_config=lambda: _nv_autoround(4, 16, 16),
-    quantize_dequantize=_make_rtn("fp4_e2m1", 16),
+    quantize_dequantize=_nvfp4_export_aligned_rtn,
     activation_quantize_dequantize=lambda x: x,
 ))
 
@@ -756,6 +799,71 @@ register_format(FormatSpec(
 ))
 
 
+# GGUF k-quants (llama.cpp / vLLM-GGUF serving lane) — two-tier superblock
+# formats along the input dim: fp16 super-scale(s) per 256 + quantized
+# per-sub-block scales (and mins for the asymmetric types). The single-tier
+# (weight_bits, group_size, scale_bits) fields below are chosen so
+# effective_bits_for_shape reproduces the exact fixed GGUF bpw:
+# type_size*8/block_size (Q2_K 2.625, Q3_K 3.4375, Q4_K 4.5, Q5_K 5.5,
+# Q6_K 6.5625, Q8_0 8.5) — scale_bits carries ALL non-element bytes of the
+# superblock (sub-scales + mins + fp16 d/dmin), so the accounting is exact
+# for shapes the legality gate admits (in_features % block == 0).
+#
+# quantize_dequantize routes through prismaquant.gguf_formats, whose field
+# quantizers also feed the export byte packers — emulation and shipped
+# bytes share one math path by construction. Activation emulation models
+# the ggml MMQ/MMVQ compute path (activations quantized to Q8_1: per-32
+# symmetric int8); the dequant fallback path is fp16 and strictly better,
+# so the emulation is the conservative bound.
+def _gguf_autoround(name: str, bits: int, gsize: int):
+    return dict(
+        bits=bits, group_size=gsize, sym=True, data_type="gguf",
+        gguf_type=name, act_bits=8, act_group_size=32, act_sym=True,
+        act_data_type="int", act_dynamic=True,
+    )
+
+
+def _make_gguf_spec(name: str, weight_bits: int, group_size: int,
+                    scale_bits: int) -> FormatSpec:
+    return FormatSpec(
+        name=name,
+        weight_bits=weight_bits, group_size=group_size,
+        scale_bits=scale_bits, scale_dtype_name="kquant_two_tier",
+        weight_element_dtype=f"gguf_{name.lower()}",
+        act_bits=8, act_dtype_name="int8_q8_1", act_group_size=32,
+        family="gguf", min_capability_sm=60,
+        autoround_config=(
+            lambda name=name, weight_bits=weight_bits, group_size=group_size:
+            _gguf_autoround(name, weight_bits, group_size)
+        ),
+        quantize_dequantize=make_gguf_qdq(name),
+        activation_quantize_dequantize=(
+            lambda x: _rtn_uniform_int(x, 8, 32, symmetric=True)
+        ),
+    )
+
+
+register_format(_make_gguf_spec("Q2_K", 2, 256, 160))   # 84 B / 256 = 2.625
+register_format(_make_gguf_spec("Q3_K", 3, 256, 112))   # 110 B / 256 = 3.4375
+register_format(_make_gguf_spec("Q4_K", 4, 256, 128))   # 144 B / 256 = 4.5
+register_format(_make_gguf_spec("Q5_K", 5, 256, 128))   # 176 B / 256 = 5.5
+register_format(_make_gguf_spec("Q6_K", 6, 256, 144))   # 210 B / 256 = 6.5625
+register_format(_make_gguf_spec("Q8_0", 8, 32, 16))     # 34 B / 32 = 8.5
+
+# GGUF IQ family (sub-Q2_K grid codebooks + non-linear 4-bit). scale_bits
+# again carries all non-element superblock bytes so effective_bits reproduces
+# the exact ggml bpw (type_size*8/block); see prismaquant/gguf_iq_formats.py
+# for the field quantizers / byte layouts. IQ4_NL is the only block-32 rung —
+# the one usable when in_features % 256 != 0.
+register_format(_make_gguf_spec("IQ2_XXS", 2, 256, 16))   # 66 B / 256 = 2.0625
+register_format(_make_gguf_spec("IQ2_XS", 2, 256, 80))    # 74 B / 256 = 2.3125
+register_format(_make_gguf_spec("IQ2_S", 2, 256, 144))    # 82 B / 256 = 2.5625
+register_format(_make_gguf_spec("IQ3_XXS", 3, 256, 16))   # 98 B / 256 = 3.0625
+register_format(_make_gguf_spec("IQ3_S", 3, 256, 112))    # 110 B / 256 = 3.4375
+register_format(_make_gguf_spec("IQ4_XS", 4, 256, 64))    # 136 B / 256 = 4.25
+register_format(_make_gguf_spec("IQ4_NL", 4, 32, 16))     # 18 B / 32 = 4.5
+
+
 def list_formats(family: str | None = None) -> list[FormatSpec]:
     if family is None:
         return sorted(REGISTRY.values(), key=lambda s: s.effective_bits)
@@ -769,3 +877,56 @@ def get_format(name: str) -> FormatSpec:
         raise KeyError(f"Unknown format '{name}'. Available: "
                        f"{sorted((*REGISTRY.keys(), *FORMAT_ALIASES.keys()))}")
     return REGISTRY[canonical]
+
+
+def nvfp4_activation_qdq_served(
+    x: torch.Tensor,
+    input_global_scale: float,
+) -> torch.Tensor:
+    """Serve-faithful NVFP4 activation quantize-dequantize.
+
+    Emulates vLLM's runtime activation path for W4A4 NVFP4 with a static
+    per-tensor ``input_global_scale`` G (the on-disk value): per 16-group
+    along the last dim, the FP8-STORED block scale is
+    ``sf = fp8_e4m3(amax/6 * G)`` and elements quantize on the E2M1 grid
+    at effective scale ``sf / G``. This models the two effects the plain
+    dynamic emulation misses (2026-07-02 audit, M18 residual + C1):
+    subnormal/zeroed FP8 block scales when a block's amax is far below
+    the calibration amax baked into G, and CLIPPING when a block's amax
+    exceeds it. Requires ``x.shape[-1] % 16 == 0``; callers fall back to
+    the dynamic path otherwise.
+    """
+    if x.shape[-1] % 16 != 0:
+        raise ValueError(
+            f"nvfp4_activation_qdq_served needs last dim % 16 == 0, "
+            f"got {tuple(x.shape)}")
+    g = float(input_global_scale)
+    orig_shape = x.shape
+    orig_dtype = x.dtype
+    x2 = x.reshape(-1, x.shape[-1] // 16, 16).float()
+    amax = x2.abs().amax(dim=-1, keepdim=True)
+    s_real = amax / 6.0
+    # FP8 snap of the stored scale in LOADED units (clamp before the
+    # cast: torch's float8_e4m3fn cast is NOT saturating and mints NaN
+    # above ~464).
+    sf = (s_real * g).clamp(max=448.0)
+    sf = sf.to(torch.float8_e4m3fn).float()
+    s_used = sf / g
+    # sf == 0 (block scale underflowed FP8): vLLM dequantizes the whole
+    # block to exactly 0.
+    safe = s_used.clamp_min(torch.finfo(torch.float32).tiny)
+    q = (x2 / safe).clamp(-6.0, 6.0)
+    cb = _codebook_on_device(
+        _CODEBOOKS["fp4_e2m1"], device=q.device, dtype=torch.float32)
+    idx = torch.bucketize(q.contiguous().abs(), cb[cb >= 0])
+    pos = cb[cb >= 0]
+    idx_lo = (idx - 1).clamp_min(0)
+    idx_hi = idx.clamp_max(pos.numel() - 1)
+    lo, hi = pos[idx_lo], pos[idx_hi]
+    qa = q.abs()
+    # ties toward zero, matching the export codec's _round_to_codebook
+    choose_hi = (hi - qa).abs() < (qa - lo).abs()
+    rounded = torch.where(choose_hi, hi, lo) * torch.sign(q)
+    out = rounded * s_used
+    out = torch.where(sf > 0, out, torch.zeros_like(out))
+    return out.reshape(orig_shape).to(orig_dtype)

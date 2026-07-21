@@ -5,14 +5,67 @@ import subprocess
 import sys
 from pathlib import Path
 
+import math
+
 from prismaquant.select_validated_frontier import (
+    _frontier_from_rows,
+    _kneedle_convex_decreasing,
+    _log_error_values,
+    _saturation_pick,
     leave_one_out_kneedle_diagnostic,
     measured_frontier,
+    measured_rows,
     practical_knee,
     select_frontier_point,
     spearman_rank_correlation,
     worst_rank_inversion,
 )
+
+
+def _sat_results(stderr):
+    # flat tail (6.0..8.0 within noise of asymptote), decreasing before it
+    rows = [(4.5, 0.10), (5.0, 0.06), (6.0, 0.030), (7.0, 0.029), (8.0, 0.028)]
+    out = []
+    for bpp, kl in rows:
+        r = {"label": f"a{bpp}", "path": f"/x/a{bpp}.json", "bpp": bpp,
+             "last_token_kl": kl, "format_counts": {}}
+        if stderr is not None:
+            r["kl_stderr"] = stderr
+        out.append(r)
+    return out
+
+
+def test_saturation_mode_picks_bstar_with_real_stderr():
+    sel, frontier = select_frontier_point(
+        _sat_results(3e-3), mode="saturation", sat_z=2.0)
+    assert sel["bpp"] == 6.0   # 6/7/8 indistinguishable within the band -> B*=6
+    idx, sat = _saturation_pick(frontier, 2.0)
+    assert sat["no_noise_floor"] is False
+    assert frontier[idx]["bpp"] == 6.0
+
+
+def test_saturation_mode_zero_stderr_flags_no_noise_floor():
+    sel, frontier = select_frontier_point(
+        _sat_results(0.0), mode="saturation", sat_z=2.0)
+    assert sel["bpp"] == 8.0   # band collapses -> densest asymptote (most bits)
+    _idx, sat = _saturation_pick(frontier, 2.0)
+    assert sat["no_noise_floor"] is True
+
+
+def test_saturation_mode_missing_stderr_key_is_no_noise_floor():
+    # rows entirely lacking kl_stderr must not KeyError; treated as 0 stderr.
+    sel, frontier = select_frontier_point(
+        _sat_results(None), mode="saturation", sat_z=2.0)
+    _idx, sat = _saturation_pick(frontier, 2.0)
+    assert sat["no_noise_floor"] is True
+    assert sel["bpp"] == 8.0
+
+
+def test_saturation_single_point_frontier_does_not_crash():
+    res = [{"label": "only", "path": "/x/only.json", "bpp": 6.0,
+            "last_token_kl": 0.03, "kl_stderr": 1e-3}]
+    sel, frontier = select_frontier_point(res, mode="saturation", sat_z=2.0)
+    assert sel["bpp"] == 6.0 and len(frontier) == 1
 
 
 def test_measured_frontier_drops_dominated_points():
@@ -26,6 +79,17 @@ def test_measured_frontier_drops_dominated_points():
     frontier = measured_frontier(results)
 
     assert [row["label"] for row in frontier] == ["a", "c", "d"]
+
+
+def test_measured_rows_keep_dominated_points_for_diagnostics():
+    results = [
+        {"label": "a", "path": "a.json", "bpp": 4.5, "last_token_kl": 0.10},
+        {"label": "b", "path": "b.json", "bpp": 4.6, "last_token_kl": 0.30},
+        {"label": "c", "path": "c.json", "bpp": 5.0, "last_token_kl": 0.05},
+    ]
+
+    assert [row["label"] for row in measured_rows(results)] == ["a", "b", "c"]
+    assert [row["label"] for row in measured_frontier(results)] == ["a", "c"]
 
 
 def test_select_frontier_best_kl():
@@ -81,11 +145,20 @@ def test_practical_knee_picks_lowest_bpp_within_tolerance():
 
 
 def test_select_frontier_reports_rank_and_leave_one_out_helpers():
+    # kl_stderr >> any possible LOO shift: the stability tolerance derives
+    # from the knee's measured repeat stderr, so the pick reads stable.
+    # (kl_noise_floor must stay consistent with the eta used to build the
+    # frontier — a floor larger than the KL deltas would collapse the
+    # rebuilt leave-one-out envelopes to a single point.)
     frontier = [
-        {"label": "a", "path": "a.json", "bpp": 4.5, "kl": 0.30, "surrogate_loss": 3.0},
-        {"label": "b", "path": "b.json", "bpp": 5.0, "kl": 0.20, "surrogate_loss": 2.0},
-        {"label": "c", "path": "c.json", "bpp": 5.5, "kl": 0.10, "surrogate_loss": 1.0},
-        {"label": "d", "path": "d.json", "bpp": 6.0, "kl": 0.09, "surrogate_loss": 0.5},
+        {"label": "a", "path": "a.json", "bpp": 4.5, "kl": 0.30,
+         "surrogate_loss": 3.0, "kl_stderr": 10.0},
+        {"label": "b", "path": "b.json", "bpp": 5.0, "kl": 0.20,
+         "surrogate_loss": 2.0, "kl_stderr": 10.0},
+        {"label": "c", "path": "c.json", "bpp": 5.5, "kl": 0.10,
+         "surrogate_loss": 1.0, "kl_stderr": 10.0},
+        {"label": "d", "path": "d.json", "bpp": 6.0, "kl": 0.09,
+         "surrogate_loss": 0.5, "kl_stderr": 10.0},
     ]
 
     assert spearman_rank_correlation(frontier) > 0.9
@@ -93,10 +166,10 @@ def test_select_frontier_reports_rank_and_leave_one_out_helpers():
         frontier,
         frontier[1],
         tolerance_bpp=10.0,
-        kl_noise_floor=10.0,
     )
     assert diagnostic["enabled"]
     assert diagnostic["stable"]
+    assert diagnostic["stability_tolerance_source"] == "repeat_stderr"
 
 
 def test_measured_frontier_extracts_surrogate_from_nested_mse():
@@ -221,3 +294,205 @@ def test_select_validated_frontier_cli_writes_layer_config(tmp_path):
 
     selected = json.loads(summary.read_text())["selected"]
     assert selected["label"] == "candidate"
+
+
+def test_select_validated_frontier_diagnostics_include_dominated_rows(tmp_path):
+    assignment_paths = {}
+    for label in ("a", "b", "c"):
+        path = tmp_path / f"{label}.json"
+        path.write_text(json.dumps({
+            "assignment": {
+                "model.layers.0.self_attn.q_proj": "BF16",
+            },
+        }))
+        assignment_paths[label] = path
+
+    validation_path = tmp_path / "validation.json"
+    validation_path.write_text(json.dumps({
+        "results": [
+            {"label": "a", "path": str(assignment_paths["a"]), "bpp": 4.5,
+             "last_token_kl": 0.10, "mse": {"predicted_dloss_sum": 2.0}},
+            # Dominated by a on both bpp and KL, but surrogate ranks it best.
+            {"label": "b", "path": str(assignment_paths["b"]), "bpp": 4.6,
+             "last_token_kl": 0.30, "mse": {"predicted_dloss_sum": 1.0}},
+            {"label": "c", "path": str(assignment_paths["c"]), "bpp": 5.0,
+             "last_token_kl": 0.05, "mse": {"predicted_dloss_sum": 3.0}},
+        ],
+    }))
+    layer_config = tmp_path / "layer_config.json"
+    assignment_out = tmp_path / "selected_assignment.json"
+    summary_path = tmp_path / "selection.json"
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "prismaquant.select_validated_frontier",
+            "--validation-json",
+            str(validation_path),
+            "--mode",
+            "best-kl",
+            "--output-layer-config",
+            str(layer_config),
+            "--output-assignment",
+            str(assignment_out),
+            "--output-summary",
+            str(summary_path),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+    )
+
+    summary = json.loads(summary_path.read_text())
+    assert summary["n_results"] == 3
+    assert summary["n_frontier"] == 2
+    assert summary["surrogate_spearman"] is not None
+    inversion = summary["surrogate_worst_rank_inversion"]
+    assert inversion["predicted_best_label"] == "b"
+    assert inversion["predicted_worse_label"] == "c"
+
+
+def test_load_assignment_canonicalizes_autoround_dicts(tmp_path):
+    # Regression: AutoRound-style dict entries used to be silently
+    # stringified ("{'DATA_TYPE': 'NV_FP', ...}") instead of parsed.
+    from prismaquant.select_validated_frontier import _load_assignment
+
+    path = tmp_path / "assignment.json"
+    path.write_text(json.dumps({
+        "model.layers.0.mlp.experts.gate_up_proj": {
+            "data_type": "nv_fp", "bits": 4, "group_size": 16, "sym": True,
+        },
+        "model.layers.0.self_attn.q_proj": {
+            "data_type": "fp8_e4m3", "bits": 8, "group_size": 0,
+        },
+        "model.layers.0.self_attn.o_proj": "bf16",
+        "model.layers.1.self_attn.o_proj": "FP8_SOURCE",
+    }))
+    assignment = _load_assignment(path)
+    assert assignment == {
+        "model.layers.0.mlp.experts.gate_up_proj": "NVFP4",
+        "model.layers.0.self_attn.q_proj": "FP8_E4M3",
+        "model.layers.0.self_attn.o_proj": "BF16",
+        "model.layers.1.self_attn.o_proj": "FP8_SOURCE",
+    }
+
+
+def test_log_error_floors_non_positive_at_min_positive():
+    # A measured KL <= 0 is "at the floor of measurement", not a million
+    # times better than the best real point (audit §3.1).
+    values = [0.10, 0.01, 0.0, -1e-9]
+    logs = _log_error_values(values)
+    assert logs[0] == math.log10(0.10)
+    assert logs[1] == math.log10(0.01)
+    # Non-positive values land exactly 0 decades below the smallest real point.
+    assert logs[2] == math.log10(0.01)
+    assert logs[3] == math.log10(0.01)
+
+
+def test_kneedle_zero_kl_point_does_not_flip_knee_to_worst_point():
+    # Audit §3.1 synthetic: a decreasing frontier {4.0/0.10 .. 6.0/0.010} plus
+    # a near-passthrough point measuring KL 0.0. The old 1e-6 floor put that
+    # point 6 fake decades below the curve, compressing the real points into a
+    # flat band and flipping the knee to the lowest-bpp (worst) candidate.
+    base = [
+        {"label": "p40", "bpp": 4.0, "kl": 0.10},
+        {"label": "p45", "bpp": 4.5, "kl": 0.055},
+        {"label": "p50", "bpp": 5.0, "kl": 0.030},
+        {"label": "p55", "bpp": 5.5, "kl": 0.017},
+        {"label": "p60", "bpp": 6.0, "kl": 0.010},
+    ]
+    with_zero = base + [{"label": "p65", "bpp": 6.5, "kl": 0.0}]
+
+    assert base[_kneedle_convex_decreasing(base)]["label"] == "p50"
+    knee = with_zero[_kneedle_convex_decreasing(with_zero)]
+    # The zero point reads as "at the measurement floor" (== 0.010), so the
+    # curve is flat past 6.0 and the knee lands where it reaches the floor —
+    # emphatically not at the curve start.
+    assert knee["label"] != "p40"
+    assert knee["label"] == "p60"
+
+
+def _loo_rows():
+    return [
+        {"label": "a", "path": "a", "bpp": 4.0, "kl": 0.30},
+        {"label": "b", "path": "b", "bpp": 4.5, "kl": 0.12},
+        # Dominated by b; must re-enter the envelope when b is dropped.
+        {"label": "b2", "path": "b2", "bpp": 4.6, "kl": 0.125},
+        {"label": "c", "path": "c", "bpp": 5.0, "kl": 0.10},
+        {"label": "d", "path": "d", "bpp": 5.5, "kl": 0.095},
+        {"label": "e", "path": "e", "bpp": 6.0, "kl": 0.09},
+    ]
+
+
+def test_leave_one_out_rebuilds_envelope_from_all_rows():
+    rows = _loo_rows()
+    frontier = _frontier_from_rows(rows)
+    assert [r["label"] for r in frontier] == ["a", "b", "c", "d", "e"]
+    selected = frontier[_kneedle_convex_decreasing(frontier)]
+    assert selected["label"] == "b"
+
+    rebuilt = leave_one_out_kneedle_diagnostic(
+        frontier, selected, all_rows=rows,
+    )
+    frozen = leave_one_out_kneedle_diagnostic(frontier, selected)
+    rebuilt_picks = {p["dropped_label"]: p["selected_label"] for p in rebuilt["picks"]}
+    frozen_picks = {p["dropped_label"]: p["selected_label"] for p in frozen["picks"]}
+    # Dropping the knee lets the dominated interior point b2 re-enter the
+    # envelope and win the kneedle; the frozen envelope could never see it.
+    assert rebuilt_picks["b"] == "b2"
+    assert frozen_picks["b"] == "c"
+
+
+def test_leave_one_out_stability_tolerance_from_repeat_stderr():
+    rows = [
+        {"label": "a", "path": "a", "bpp": 4.0, "kl": 0.400, "kl_stderr": 2e-3},
+        {"label": "b", "path": "b", "bpp": 4.5, "kl": 0.200, "kl_stderr": 2e-3},
+        {"label": "c", "path": "c", "bpp": 5.0, "kl": 0.1000, "kl_stderr": 2e-3},
+        {"label": "d", "path": "d", "bpp": 5.2, "kl": 0.0990, "kl_stderr": 2e-3},
+        {"label": "e", "path": "e", "bpp": 6.0, "kl": 0.0950, "kl_stderr": 2e-3},
+        {"label": "f", "path": "f", "bpp": 6.5, "kl": 0.0930, "kl_stderr": 2e-3},
+    ]
+    frontier = _frontier_from_rows(rows)
+    selected = frontier[_kneedle_convex_decreasing(frontier)]
+    assert selected["label"] == "c"
+
+    diag = leave_one_out_kneedle_diagnostic(
+        frontier, selected, tolerance_bpp=0.6, all_rows=rows,
+    )
+    # LOO shift (c -> d, |dKL| = 0.001) is within the knee's measured repeat
+    # stderr (0.002): indistinguishable from measurement noise -> stable.
+    assert diag["stability_tolerance_source"] == "repeat_stderr"
+    assert diag["kl_stability_tolerance"] == 2e-3
+    assert diag["max_kl_shift"] <= 2e-3
+    assert diag["stable"] is True
+
+    # Without repeat data there is no measured noise scale: strict 0.
+    strict_rows = [
+        {k: v for k, v in row.items() if k != "kl_stderr"} for row in rows
+    ]
+    strict_frontier = _frontier_from_rows(strict_rows)
+    strict_selected = strict_frontier[_kneedle_convex_decreasing(strict_frontier)]
+    strict = leave_one_out_kneedle_diagnostic(
+        strict_frontier, strict_selected, tolerance_bpp=0.6, all_rows=strict_rows,
+    )
+    assert strict["stability_tolerance_source"] == "strict"
+    assert strict["kl_stability_tolerance"] == 0.0
+    assert strict["stable"] is False
+
+    # An explicit noise floor always wins over the stderr.
+    floored = leave_one_out_kneedle_diagnostic(
+        frontier, selected, tolerance_bpp=0.6, kl_noise_floor=0.05, all_rows=rows,
+    )
+    assert floored["stability_tolerance_source"] == "kl_noise_floor"
+    assert floored["kl_stability_tolerance"] == 0.05
+
+
+def test_load_assignment_unwraps_assignment_key(tmp_path):
+    from prismaquant.select_validated_frontier import _load_assignment
+
+    path = tmp_path / "wrapped.json"
+    path.write_text(json.dumps({
+        "schema": "prismaquant.validated_frontier_assignment.v1",
+        "assignment": {"model.layers.0.mlp.up_proj": "nvfp4"},
+    }))
+    assert _load_assignment(path) == {"model.layers.0.mlp.up_proj": "NVFP4"}

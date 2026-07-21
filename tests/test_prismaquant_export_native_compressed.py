@@ -6,9 +6,11 @@ that has to stay in sync with vLLM's compressed-tensors loader.
 """
 from __future__ import annotations
 
+import io
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -24,6 +26,7 @@ from prismaquant.export_native_compressed import (
     NVFP4_MAX,
     PER_EXPERT_MOE_REGEX,
     _bf16_upgrade_audit,
+    _compressed_tensor_key,
     _compute_layer_joint_nvfp4,
     _coerce_runtime_legal_assignment,
     _passthrough_dtype,
@@ -389,6 +392,17 @@ class _TinyQwenPackedExperts(nn.Module):
         self.down_proj = nn.Parameter(torch.randn(2, 32, 64))
 
 
+def _tiny_qwen_packed_root():
+    root = nn.Module()
+    root.model = nn.Module()
+    root.model.language_model = nn.Module()
+    layer = nn.Module()
+    layer.mlp = nn.Module()
+    layer.mlp.experts = _TinyQwenPackedExperts()
+    root.model.language_model.layers = nn.ModuleList([layer])
+    return root
+
+
 class TestPackedExpertExport(unittest.TestCase):
     def test_mxfp8_split_experts_emit_weight_suffix_for_vllm_loader(self):
         """Qwen3.5's split expert loader matches
@@ -397,13 +411,7 @@ class TestPackedExpertExport(unittest.TestCase):
         skipped with "not found in params_dict" warnings.
         """
 
-        root = nn.Module()
-        root.model = nn.Module()
-        root.model.language_model = nn.Module()
-        layer = nn.Module()
-        layer.mlp = nn.Module()
-        layer.mlp.experts = _TinyQwenPackedExperts()
-        root.model.language_model.layers = nn.ModuleList([layer])
+        root = _tiny_qwen_packed_root()
 
         assignment = {
             "model.layers.0.mlp.experts.gate_up_proj": "MXFP8_E4M3",
@@ -431,8 +439,208 @@ class TestPackedExpertExport(unittest.TestCase):
         self.assertNotIn(f"{prefix}.0.up_proj", tensors)
         self.assertNotIn(f"{prefix}.0.down_proj", tensors)
         self.assertEqual(
-            hist.get(("packed_moe_per_expert", "MXFP8_E4M3")),
+            hist.get(("packed_moe_per_expert", "MXFP8_E4M3+rtn")),
             2,
+        )
+
+    def test_packed_expert_missing_production_cache_raises_by_default(self):
+        from prismaquant.production_weight_cache import ProductionWeightCache
+
+        assignment = {
+            "model.layers.0.mlp.experts.gate_up_proj": "NVFP4",
+            "model.layers.0.mlp.experts.down_proj": "NVFP4",
+        }
+        old_cache = enc._PRODUCTION_WEIGHT_CACHE
+        old_escape = enc._ALLOW_PACKED_EXPERT_RTN
+        try:
+            enc._PRODUCTION_WEIGHT_CACHE = ProductionWeightCache(
+                weights={}, levers={"gptq": True})
+            enc._ALLOW_PACKED_EXPERT_RTN = False
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "has no production-cache render",
+            ):
+                enc._materialize_tensors_inmemory(
+                    _tiny_qwen_packed_root(),
+                    assignment,
+                    bf16_passthrough=set(),
+                    profile=Qwen3_5Profile(),
+                )
+        finally:
+            enc._PRODUCTION_WEIGHT_CACHE = old_cache
+            enc._ALLOW_PACKED_EXPERT_RTN = old_escape
+
+    def test_packed_expert_rtn_escape_allows_cache_miss(self):
+        from prismaquant.production_weight_cache import ProductionWeightCache
+
+        assignment = {
+            "model.layers.0.mlp.experts.gate_up_proj": "NVFP4",
+            "model.layers.0.mlp.experts.down_proj": "NVFP4",
+        }
+        old_cache = enc._PRODUCTION_WEIGHT_CACHE
+        old_escape = enc._ALLOW_PACKED_EXPERT_RTN
+        try:
+            enc._PRODUCTION_WEIGHT_CACHE = ProductionWeightCache(
+                weights={}, levers={"gptq": True})
+            enc._ALLOW_PACKED_EXPERT_RTN = True
+            tensors, hist = enc._materialize_tensors_inmemory(
+                _tiny_qwen_packed_root(),
+                assignment,
+                bf16_passthrough=set(),
+                profile=Qwen3_5Profile(),
+            )
+        finally:
+            enc._PRODUCTION_WEIGHT_CACHE = old_cache
+            enc._ALLOW_PACKED_EXPERT_RTN = old_escape
+
+        self.assertTrue(any(k.endswith(".weight_packed") for k in tensors))
+        self.assertEqual(
+            hist.get(("packed_moe_per_expert", "NVFP4+rtn")),
+            2,
+        )
+
+    def test_packed_expert_no_cache_path_warns_before_rtn(self):
+        assignment = {
+            "model.layers.0.mlp.experts.gate_up_proj": "MXFP8_E4M3",
+            "model.layers.0.mlp.experts.down_proj": "MXFP8_E4M3",
+        }
+        old_cache = enc._PRODUCTION_WEIGHT_CACHE
+        old_escape = enc._ALLOW_PACKED_EXPERT_RTN
+        stdout = io.StringIO()
+        try:
+            enc._PRODUCTION_WEIGHT_CACHE = None
+            enc._ALLOW_PACKED_EXPERT_RTN = False
+            with redirect_stdout(stdout):
+                _tensors, hist = enc._materialize_tensors_inmemory(
+                    _tiny_qwen_packed_root(),
+                    assignment,
+                    bf16_passthrough=set(),
+                    profile=Qwen3_5Profile(),
+                )
+        finally:
+            enc._PRODUCTION_WEIGHT_CACHE = old_cache
+            enc._ALLOW_PACKED_EXPERT_RTN = old_escape
+
+        self.assertIn("WARNING: RTN-rendering packed expert", stdout.getvalue())
+        self.assertIn("no production cache", stdout.getvalue())
+        self.assertEqual(
+            hist.get(("packed_moe_per_expert", "MXFP8_E4M3+rtn")),
+            2,
+        )
+
+    def test_packed_expert_hist_label_distinguishes_cached_and_rtn(self):
+        self.assertEqual(
+            enc._packed_expert_render_hist_label(
+                "NVFP4",
+                is_bf16=False,
+                source_label="bf16",
+                cached_3d=torch.ones(1, 1, 1),
+            ),
+            "NVFP4+cached",
+        )
+        self.assertEqual(
+            enc._packed_expert_render_hist_label(
+                "NVFP4",
+                is_bf16=False,
+                source_label="bf16",
+                cached_3d=None,
+            ),
+            "NVFP4+rtn",
+        )
+        self.assertEqual(
+            enc._packed_expert_render_hist_label(
+                "BF16",
+                is_bf16=True,
+                source_label="bf16",
+                cached_3d=None,
+            ),
+            "bf16",
+        )
+
+    def test_packed_expert_export_provenance_records_escape_and_coverage(self):
+        class _Cache:
+            metadata = {
+                "packed_expert_coverage": {
+                    "layer.experts.gate_up_proj": {
+                        "rtn_fallbacks": 2,
+                        "gptq_experts": 0,
+                    }
+                }
+            }
+
+        old_cache = enc._PRODUCTION_WEIGHT_CACHE
+        old_escape = enc._ALLOW_PACKED_EXPERT_RTN
+        try:
+            enc._PRODUCTION_WEIGHT_CACHE = _Cache()
+            enc._ALLOW_PACKED_EXPERT_RTN = True
+            prov = enc._packed_expert_export_provenance()
+        finally:
+            enc._PRODUCTION_WEIGHT_CACHE = old_cache
+            enc._ALLOW_PACKED_EXPERT_RTN = old_escape
+
+        self.assertTrue(prov["rtn_escape_enabled"])
+        self.assertTrue(prov["cache_has_packed_expert_coverage"])
+        self.assertEqual(
+            prov["cache_packed_expert_coverage"][
+                "layer.experts.gate_up_proj"
+            ]["rtn_fallbacks"],
+            2,
+        )
+
+    def test_expected_cache_keys_require_packed_experts_by_default(self):
+        from prismaquant.production_weight_cache import ProductionWeightCache
+
+        assignment = {
+            "model.layers.0.mlp.experts.gate_up_proj": "NVFP4",
+            "model.layers.0.self_attn.q_proj": "NVFP4",
+        }
+        old_cache = enc._PRODUCTION_WEIGHT_CACHE
+        old_escape = enc._ALLOW_PACKED_EXPERT_RTN
+        try:
+            enc._PRODUCTION_WEIGHT_CACHE = ProductionWeightCache(
+                weights={}, levers={"gptq": True})
+            enc._ALLOW_PACKED_EXPERT_RTN = False
+            keys, missing = enc._production_cache_expected_keys(assignment)
+        finally:
+            enc._PRODUCTION_WEIGHT_CACHE = old_cache
+            enc._ALLOW_PACKED_EXPERT_RTN = old_escape
+
+        self.assertEqual(keys, [])
+        self.assertIn(
+            ("model.layers.0.mlp.experts.gate_up_proj", "NVFP4"),
+            missing,
+        )
+        self.assertIn(
+            ("model.layers.0.self_attn.q_proj", "NVFP4"),
+            missing,
+        )
+
+    def test_expected_cache_keys_escape_skips_only_packed_experts(self):
+        from prismaquant.production_weight_cache import ProductionWeightCache
+
+        assignment = {
+            "model.layers.0.mlp.experts.gate_up_proj": "NVFP4",
+            "model.layers.0.self_attn.q_proj": "NVFP4",
+        }
+        old_cache = enc._PRODUCTION_WEIGHT_CACHE
+        old_escape = enc._ALLOW_PACKED_EXPERT_RTN
+        try:
+            enc._PRODUCTION_WEIGHT_CACHE = ProductionWeightCache(
+                weights={}, levers={"gptq": True})
+            enc._ALLOW_PACKED_EXPERT_RTN = True
+            keys, missing = enc._production_cache_expected_keys(assignment)
+        finally:
+            enc._PRODUCTION_WEIGHT_CACHE = old_cache
+            enc._ALLOW_PACKED_EXPERT_RTN = old_escape
+
+        self.assertEqual(keys, [])
+        self.assertNotIn(
+            ("model.layers.0.mlp.experts.gate_up_proj", "NVFP4"),
+            missing,
+        )
+        self.assertEqual(
+            missing,
+            [("model.layers.0.self_attn.q_proj", "NVFP4")],
         )
 
 
@@ -544,7 +752,17 @@ class TestRoundTrip(unittest.TestCase):
             "INT8_W8A16": "registered allocator research format; no native exporter metadata path",
             "INT4_W4A16_g128": "registered allocator research format; no native exporter metadata path",
         }
-        self.assertEqual(set(fr.REGISTRY), reconciled | set(explicit_gaps))
+        gguf_lane = {
+            # Served via the GGUF container (export_gguf), not
+            # compressed-tensors; rendered==served equivalence is pinned
+            # bit-exact against gguf-py in tests/test_gguf_formats.py and
+            # tests/test_gguf_iq_formats.py (the IQ family).
+            "Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q8_0",
+            "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ4_XS", "IQ4_NL",
+        }
+        self.assertEqual(
+            set(fr.REGISTRY), reconciled | set(explicit_gaps) | gguf_lane
+        )
 
     def test_registry_render_dequant_matches_served_metadata(self):
         W = torch.randn(8, 128) * 1.75
@@ -554,6 +772,10 @@ class TestRoundTrip(unittest.TestCase):
             for fmt in sorted(fr.REGISTRY):
                 with self.subTest(fmt=fmt):
                     if fmt in {"MXFP6_E3M2", "MXFP6_E2M3", "INT8_W8A16", "INT4_W4A16_g128"}:
+                        continue
+                    if fr.get_format(fmt).family == "gguf":
+                        # GGUF-container formats: rendered==served is pinned
+                        # bit-exact in tests/test_gguf_formats.py.
                         continue
 
                     if fmt in {"NVFP4", "NVFP4A16"}:
@@ -659,6 +881,59 @@ class TestRoundTrip(unittest.TestCase):
             10.0,
             places=4,
         )
+
+    def test_nvfp4_scale_selection_scores_fp8_snapped_scales(self):
+        # Pins the RESEARCH path (snapped-scale scoring); default-off
+        # pending its served A/B (QC M21).
+        __import__('os').environ[
+            'PRISMAQUANT_NVFP4_SNAPPED_SCALE_SCORING'] = '1'
+        self.addCleanup(lambda: __import__('os').environ.pop(
+            'PRISMAQUANT_NVFP4_SNAPPED_SCALE_SCORING', None))
+        grouped = torch.tensor(
+            [[[
+                -0.02800447, 0.20611508, -0.25149462, 0.00026755,
+                0.25256824, -0.12001037, 0.31183860, 0.10744593,
+                -0.07380029, 0.69075495, -0.56450677, -0.01491811,
+                -0.31349361, -0.28695017, 0.01005956, 0.21302599,
+            ]]],
+            dtype=torch.float32,
+        )
+        global_real = torch.tensor(0.0003, dtype=torch.float32)
+        max_abs = grouped.abs().amax(dim=-1).clamp_min(1e-12)
+        scale_6 = max_abs / 6.0
+        scale_4 = max_abs / 4.0
+
+        real_scale = enc._select_nvfp4_group_scales(
+            grouped,
+            scale_rule=enc.NVFP4_SCALE_RULE_FOUR_OVER_SIX_MSE,
+        )
+        snapped_scale = enc._select_nvfp4_group_scales(
+            grouped,
+            scale_rule=enc.NVFP4_SCALE_RULE_FOUR_OVER_SIX_MSE,
+            global_real=global_real,
+        )
+        mse_6 = enc._nvfp4_mse_for_group_scale(
+            grouped,
+            scale_6,
+            global_real=global_real,
+        )
+        mse_4 = enc._nvfp4_mse_for_group_scale(
+            grouped,
+            scale_4,
+            global_real=global_real,
+        )
+        expected = torch.where(mse_4 < mse_6, scale_4, scale_6)
+
+        self.assertFalse(torch.equal(real_scale, snapped_scale))
+        torch.testing.assert_close(snapped_scale, expected)
+
+        pack_scale, pack_global = enc._select_nvfp4_pack_scales_and_global(
+            grouped,
+            global_real_override=global_real,
+            scale_rule=enc.NVFP4_SCALE_RULE_FOUR_OVER_SIX_MSE,
+        )
+        torch.testing.assert_close(pack_global, global_real)
+        torch.testing.assert_close(pack_scale, expected)
 
     def test_nvfp4_four_over_six_global_real_matches_chosen_scales(self):
         W = torch.tensor(
@@ -1220,6 +1495,16 @@ class TestVLLMInternalNaming(unittest.TestCase):
             "language_model.lm_head",
         )
 
+    def test_quantized_head_weight_suffix_keeps_weight_key(self):
+        self.assertEqual(
+            _compressed_tensor_key("lm_head", "weight"),
+            "lm_head.weight",
+        )
+        self.assertEqual(
+            _compressed_tensor_key("lm_head", "weight_scale"),
+            "lm_head.weight_scale",
+        )
+
     def test_multimodal_source_naming_remap(self):
         # Source on-disk uses `model.language_model.X`; vLLM internal
         # is `language_model.model.X` (the prefix swap).
@@ -1237,6 +1522,23 @@ class TestVLLMInternalNaming(unittest.TestCase):
 
 
 class TestBuildQuantizationConfig(unittest.TestCase):
+    def test_batched_nvfp4_export_comment_matches_default_on(self):
+        text = Path(enc.__file__).read_text()
+
+        self.assertNotIn("disabled by default while", text)
+        self.assertIn("PRISMAQUANT_BATCHED_NVFP4_EXPORT=0", text)
+
+    def test_build_target_list_documents_sparse_expert_wildcard(self):
+        doc = enc._build_target_list.__doc__ or ""
+
+        self.assertIn("always emit a `[0-9]+`", doc)
+        targets = enc._build_target_list([
+            "model.layers.0.mlp.experts.2.gate_proj",
+        ])
+        self.assertEqual(targets, [
+            "re:^model[.]layers[.]0[.]mlp[.]experts[.][0-9]+[.]gate_proj$",
+        ])
+
     def test_minimal_two_format_assignment(self):
         profile = Qwen3_5Profile()
         # Lots of NVFP4, fewer MXFP8 → NVFP4 becomes the catch-all
@@ -1507,6 +1809,145 @@ class TestBuildQuantizationConfig(unittest.TestCase):
                 assignment, bf16_passthrough=set(), profile=profile,
             )
 
+    def test_dense_fused_sibling_mixed_quantized_formats_rejected(self):
+        profile = Qwen3_5Profile()
+        assignment = {
+            "model.layers.0.self_attn.q_proj": "NVFP4",
+            "model.layers.0.self_attn.k_proj": "MXFP8",
+            "model.layers.0.self_attn.v_proj": "NVFP4",
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "crash@load"):
+            build_quantization_config(
+                assignment, bf16_passthrough=set(), profile=profile,
+            )
+
+    def test_dense_fused_sibling_quantized_bf16_mix_rejected(self):
+        profile = Qwen3_5Profile()
+        assignment = {
+            "model.layers.0.self_attn.q_proj": "NVFP4",
+            "model.layers.0.self_attn.k_proj": "BF16",
+            "model.layers.0.self_attn.v_proj": "BF16",
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "silent-corruption"):
+            build_quantization_config(
+                assignment, bf16_passthrough=set(), profile=profile,
+            )
+
+    def test_incomplete_fused_sibling_mixed_present_states_rejected(self):
+        profile = Qwen3_5Profile()
+        assignment = {
+            "model.layers.0.self_attn.q_proj": "NVFP4",
+            "model.layers.0.self_attn.k_proj": "BF16",
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "silent-corruption"):
+            build_quantization_config(
+                assignment,
+                bf16_passthrough=set(),
+                profile=profile,
+            )
+
+    def test_quantization_config_preflight_rejects_before_render(self):
+        profile = Qwen3_5Profile()
+        assignment = {
+            "model.layers.0.self_attn.q_proj": "NVFP4",
+            "model.layers.0.self_attn.k_proj": "BF16",
+            "model.layers.0.self_attn.v_proj": "BF16",
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "before rendering"):
+            enc._preflight_quantization_config(
+                assignment,
+                set(),
+                profile=profile,
+            )
+
+    def test_fp8_source_overlay_keeps_config_matched_to_emitted_bytes(self):
+        profile = Qwen3_5Profile()
+        assignment = {
+            "model.layers.0.self_attn.o_proj": "BF16",
+        }
+        bf16_passthrough = {
+            "model.layers.0.self_attn.o_proj",
+            "lm_head",
+        }
+        fp8_map = {
+            "model.layers.0.self_attn.o_proj": ("shard0", "o.scale"),
+            "model.layers.0.mlp.down_proj": ("shard0", "down.scale"),
+        }
+        source_dtypes = {
+            "model.layers.0.self_attn.o_proj.weight": torch.float8_e4m3fn,
+            "model.layers.0.mlp.down_proj.weight": torch.float8_e4m3fn,
+        }
+
+        with (
+            patch.object(enc, "_build_fp8_source_map", return_value=fp8_map),
+            patch(
+                "prismaquant.layer_streaming._build_weight_map",
+                return_value=({}, {}),
+            ),
+            patch.object(enc, "_build_source_dtype_map", return_value=source_dtypes),
+        ):
+            config_assignment, config_bf16, overrides = (
+                enc._fp8_source_config_overlay(
+                    "/model",
+                    assignment,
+                    bf16_passthrough,
+                    profile,
+                )
+            )
+
+        self.assertEqual(
+            config_assignment["model.layers.0.self_attn.o_proj"],
+            "FP8_SOURCE",
+        )
+        self.assertEqual(
+            config_assignment["model.layers.0.mlp.down_proj"],
+            "FP8_SOURCE",
+        )
+        self.assertEqual(
+            overrides,
+            {
+                "model.layers.0.self_attn.o_proj",
+                "model.layers.0.mlp.down_proj",
+            },
+        )
+        self.assertNotIn("model.layers.0.self_attn.o_proj", config_bf16)
+        self.assertIn("lm_head", config_bf16)
+
+        source_iter = [
+            ("model.layers.0.self_attn.o_proj.weight", [128, 128]),
+            ("model.layers.0.mlp.down_proj.weight", [128, 128]),
+        ]
+        self.assertEqual(
+            compute_extra_ignore(source_iter, config_assignment, profile),
+            [],
+        )
+        qc = build_quantization_config(
+            config_assignment,
+            config_bf16,
+            profile=profile,
+        )
+        targets = {
+            target
+            for group in qc["config_groups"].values()
+            for target in group["targets"]
+        }
+        self.assertIn(
+            "re:^language_model[.]model[.]layers[.]0[.]self_attn[.]o_proj$",
+            targets,
+        )
+        self.assertIn(
+            "re:^language_model[.]model[.]layers[.]0[.]mlp[.]down_proj$",
+            targets,
+        )
+        self.assertNotIn(
+            "language_model.model.layers.0.self_attn.o_proj",
+            qc["ignore"],
+        )
+
     def test_no_class_name_catchall_target(self):
         # The class-name catch-all "Linear" short-circuits vLLM's
         # fused-layer match path and was the bug that produced wrong
@@ -1731,11 +2172,38 @@ class TestProductionCacheExportPath(unittest.TestCase):
             self.assertIsNotNone(out)
             self.assertIn("weight_packed", out)
             self.assertIn("input_global_scale", out)
+            # legacy default convention: 6 / max_abs = 6/3 = 2.0.
             self.assertAlmostEqual(
                 float(out["input_global_scale"].item()), 2.0, places=5)
         finally:
             m._PRODUCTION_WEIGHT_CACHE = saved_cache
             m._INPUT_GLOBAL_SCALES = saved_scales
+
+    def test_production_cache_scales_use_profile_fused_groups(self):
+        import prismaquant.export_native_compressed as m
+        from prismaquant.production_weight_cache import ProductionWeightCache
+
+        class CustomProfile:
+            def fused_sibling_group(self, qname: str) -> str | None:
+                if qname.endswith(".a_proj") or qname.endswith(".b_proj"):
+                    return qname.rsplit(".", 1)[0] + ".ab_proj"
+                return None
+
+        cache = ProductionWeightCache(
+            weights={},
+            levers={},
+            activation_max_abs={
+                "model.layers.0.a_proj": 12.0,
+                "model.layers.0.b_proj": 24.0,
+            },
+        )
+
+        scales = m._production_cache_scales(cache, profile=CustomProfile())
+
+        # legacy default: 6/max_abs; the fused join takes min
+        # (largest max_abs=24 wins) -> 6/24 = 0.25.
+        self.assertEqual(scales["model.layers.0.a_proj"], 0.25)
+        self.assertEqual(scales["model.layers.0.b_proj"], 0.25)
 
     def test_mxfp8_alias_hits_e4m3_cache_key(self):
         import prismaquant.export_native_compressed as m
@@ -1855,6 +2323,61 @@ class TestProductionCacheExportPath(unittest.TestCase):
         finally:
             m._PRODUCTION_WEIGHT_CACHE = saved_cache
             m._CACHED_ACTIVATIONS = saved_acts
+
+
+    def test_inmemory_mtp_linear_uses_production_cache(self):
+        import prismaquant.export_native_compressed as m
+        from prismaquant.production_weight_cache import ProductionWeightCache
+
+        wrapper = nn.Module()
+        wrapper.add_module("mtp", nn.Module())
+        wrapper.mtp.add_module("proj", nn.Linear(16, 8, bias=False))
+        W = torch.randn(8, 16) * 0.1
+        cache = ProductionWeightCache(
+            weights={("mtp.proj", "NVFP4"): W},
+            levers={"gptq": True},
+            activation_max_abs={"mtp.proj": 3.0},
+        )
+        saved_cache = m._PRODUCTION_WEIGHT_CACHE
+        saved_scales = m._INPUT_GLOBAL_SCALES
+        try:
+            m._PRODUCTION_WEIGHT_CACHE = cache
+            m._INPUT_GLOBAL_SCALES = m._production_cache_scales(cache)
+            out, hist = m._materialize_tensors_inmemory(
+                wrapper,
+                {"mtp.proj": "NVFP4"},
+                bf16_passthrough=set(),
+                profile=_IdentityProfile(),
+            )
+        finally:
+            m._PRODUCTION_WEIGHT_CACHE = saved_cache
+            m._INPUT_GLOBAL_SCALES = saved_scales
+
+        self.assertIn("mtp.proj.weight_packed", out)
+        self.assertIn("mtp.proj.input_global_scale", out)
+        self.assertEqual(hist[("linear", "NVFP4_PRODUCTION_CACHE")], 1)
+
+    def test_inmemory_mtp_linear_missing_production_cache_raises(self):
+        import prismaquant.export_native_compressed as m
+        from prismaquant.production_weight_cache import ProductionWeightCache
+
+        wrapper = nn.Module()
+        wrapper.add_module("mtp", nn.Module())
+        wrapper.mtp.add_module("proj", nn.Linear(16, 8, bias=False))
+        cache = ProductionWeightCache(weights={}, levers={"gptq": True})
+        saved_cache = m._PRODUCTION_WEIGHT_CACHE
+        try:
+            m._PRODUCTION_WEIGHT_CACHE = cache
+            with self.assertRaisesRegex(RuntimeError, "auxiliary Linear mtp.proj"):
+                m._materialize_tensors_inmemory(
+                    wrapper,
+                    {"mtp.proj": "NVFP4"},
+                    bf16_passthrough=set(),
+                    profile=_IdentityProfile(),
+                )
+        finally:
+            m._PRODUCTION_WEIGHT_CACHE = saved_cache
+
 
 class TestFusedSiblingJointGlobalScale(unittest.TestCase):
     """vLLM warns when q/k/v/gate/up have different weight_global_scale.
@@ -2216,6 +2739,37 @@ class TestRuntimeLegalAssignment(unittest.TestCase):
             ("model.layers.0.self_attn.o_proj", [128, 5120], "FP8_E5M2")
         ])
 
+    def test_gguf_formats_hard_fail_instead_of_bf16_coercion(self):
+        """A GGUF assignment reaching the compressed-tensors exporter is a
+        wrong-container invocation (EXPORT_CONTAINER=gguf was not set), not
+        a research format: silent BF16 coercion would ship a ~16 bpp
+        artifact unrelated to the allocated budget."""
+        from safetensors.torch import save_file
+
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            shard = td / "model-00001-of-00001.safetensors"
+            save_file({
+                "model.language_model.layers.0.self_attn.o_proj.weight": (
+                    torch.zeros(128, 5120, dtype=torch.bfloat16)
+                ),
+            }, str(shard))
+            with open(td / "model.safetensors.index.json", "w") as f:
+                json.dump({
+                    "weight_map": {
+                        "model.language_model.layers.0.self_attn.o_proj.weight": (
+                            shard.name
+                        ),
+                    }
+                }, f)
+
+            with self.assertRaisesRegex(ValueError, "GGUF"):
+                _coerce_runtime_legal_assignment(
+                    str(td),
+                    {"model.layers.0.self_attn.o_proj": "Q2_K"},
+                    Qwen3_5Profile(),
+                )
+
     def test_bf16_audit_classifies_allocator_bf16_candidates(self):
         from safetensors.torch import save_file
 
@@ -2490,20 +3044,77 @@ if __name__ == "__main__":
 
 class TestNvfp4InputGlobalScale(unittest.TestCase):
     """Per-layer input_global_scale calibration from cached activations.
-    
-    `compute_nvfp4_input_global_scale(activations)` returns FP4_MAX/max_abs
-    so scaled activations fit [-6, 6]. Zero/negative max-abs falls back to
-    the default."""
 
-    def test_max_abs_scales_to_fp4_range(self):
+    Default: legacy ``6/max_abs`` bytes (backwards-compatible — the
+    generate_gparam convention is strongly artifact-dependent on served
+    KL: 35B MoE -14.1%, 27B dense +37.5%, thin-calib LFM +5.8%; see the
+    2026-07-02 audit C1 addendum). PRISMAQUANT_NVFP4_INPUT_GSCALE_FP8_RANGE=1
+    opts into the compressed-tensors ``448*6/max_abs`` convention behind
+    a per-artifact served A/B."""
+
+    def test_default_is_legacy_6_over_amax(self):
         import torch
         from prismaquant.export_native_compressed import (
             compute_nvfp4_input_global_scale, _FP4_E2M1_MAX,
         )
         acts = torch.tensor([0.0, 1.5, -3.0, 2.0])
         s = compute_nvfp4_input_global_scale(acts)
-        # max_abs=3.0, scale=6/3=2.0 → scaled activations in [-6, 6]
         self.assertAlmostEqual(s, _FP4_E2M1_MAX / 3.0, places=5)
+
+    def test_env_one_opts_into_fp8_range_convention(self):
+        import os
+        import torch
+        from prismaquant.export_native_compressed import (
+            compute_nvfp4_input_global_scale, _FP4_E2M1_MAX, _FP8_E4M3_MAX,
+        )
+        acts = torch.tensor([0.0, 1.5, -3.0, 2.0])
+        key = "PRISMAQUANT_NVFP4_INPUT_GSCALE_FP8_RANGE"
+        saved = os.environ.get(key)
+        try:
+            os.environ[key] = "1"
+            s = compute_nvfp4_input_global_scale(acts)
+        finally:
+            if saved is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = saved
+        # max_abs=3.0, scale = 448*6/3 = 896.0 (generate_gparam convention)
+        self.assertAlmostEqual(
+            s, _FP8_E4M3_MAX * _FP4_E2M1_MAX / 3.0, places=3)
+
+    def test_matches_compressed_tensors_generate_gparam(self):
+        """Oracle test: our input_global_scale must equal the installed
+        compressed-tensors `generate_gparam` (the convention vLLM's
+        CompressedTensorsW4A4Fp4 loads) to fp32 tolerance."""
+        import torch
+        try:
+            from compressed_tensors.quantization.utils import generate_gparam
+        except Exception as e:  # pragma: no cover - env without the lib
+            self.skipTest(f"compressed_tensors not importable: {e}")
+        from prismaquant.export_native_compressed import (
+            compute_nvfp4_input_global_scale,
+        )
+        import os
+        torch.manual_seed(0)
+        acts = torch.randn(64, 128) * 3.7
+        expected = generate_gparam(
+            updated_min_val=acts.amin(),
+            updated_max_val=acts.amax(),
+        )
+        key = "PRISMAQUANT_NVFP4_INPUT_GSCALE_FP8_RANGE"
+        saved = os.environ.get(key)
+        try:
+            os.environ[key] = "1"
+            ours = compute_nvfp4_input_global_scale(acts)
+        finally:
+            if saved is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = saved
+        self.assertAlmostEqual(
+            ours, float(expected.item()),
+            delta=abs(float(expected.item())) * 1e-6,
+        )
 
     def test_degenerate_all_zero_falls_back(self):
         import torch
@@ -2750,6 +3361,58 @@ class TestActivationAwarePasses(unittest.TestCase):
         torch.testing.assert_close(W_swept, W_rtn)
         self.assertGreater(float((W - W_failed).pow(2).mean().item()), 0.0)
 
+    def test_do_no_harm_gate_failure_warns_and_counts(self):
+        import os
+        import torch
+        from unittest import mock
+        import prismaquant.export_native_compressed as m
+
+        torch.manual_seed(912)
+        W = torch.randn(8, 16) * 0.3
+        X = torch.randn(16, 16)
+        saved_stats = m._DO_NO_HARM_STATS.copy()
+        saved_dnh = os.environ.get("PRISMAQUANT_DO_NO_HARM")
+        saved_sweep = os.environ.get("PRISMAQUANT_GPTQ_DAMP_SWEEP")
+        failure_count = None
+        try:
+            m._DO_NO_HARM_STATS.clear()
+            os.environ["PRISMAQUANT_DO_NO_HARM"] = "1"
+            os.environ["PRISMAQUANT_GPTQ_DAMP_SWEEP"] = "0"
+            with (
+                mock.patch.object(
+                    m,
+                    "_activation_col_importance_for_gptq",
+                    side_effect=RuntimeError("boom"),
+                ),
+                mock.patch("builtins.print") as printed,
+            ):
+                out = m._quantize_2d(
+                    W,
+                    "NVFP4",
+                    gptq_enabled=True,
+                    cached_activations=X,
+                    linear_name="demo.linear",
+                )
+                failure_count = m._DO_NO_HARM_STATS["NVFP4_failures"]
+        finally:
+            m._DO_NO_HARM_STATS.clear()
+            m._DO_NO_HARM_STATS.update(saved_stats)
+            if saved_dnh is None:
+                os.environ.pop("PRISMAQUANT_DO_NO_HARM", None)
+            else:
+                os.environ["PRISMAQUANT_DO_NO_HARM"] = saved_dnh
+            if saved_sweep is None:
+                os.environ.pop("PRISMAQUANT_GPTQ_DAMP_SWEEP", None)
+            else:
+                os.environ["PRISMAQUANT_GPTQ_DAMP_SWEEP"] = saved_sweep
+
+        self.assertIn("weight_packed", out)
+        self.assertTrue(any(
+            "[do-no-harm] WARN demo.linear NVFP4 gate failed" in str(call)
+            for call in printed.call_args_list
+        ))
+        self.assertEqual(failure_count, 1)
+
     def test_composed_passes_reduce_output_space_error_vs_rtn(self):
         """Integration test: synthetic linear + imbalanced activations.
         Running `_quantize_2d` with GPTQ enabled should give no worse
@@ -2862,6 +3525,11 @@ class TestActivationAwarePasses(unittest.TestCase):
         )
 
     def test_quantize_2d_threads_lift_gptq_flags(self):
+        # These tests verify flag threading through the SWEPT
+        # path, which is env-gated (default off since 2026-06-12).
+        __import__('os').environ['PRISMAQUANT_GPTQ_DAMP_SWEEP'] = '1'
+        self.addCleanup(lambda: __import__('os').environ.pop(
+            'PRISMAQUANT_GPTQ_DAMP_SWEEP', None))
         import os
         import torch
         import prismaquant.export_native_compressed as m
@@ -2899,6 +3567,11 @@ class TestActivationAwarePasses(unittest.TestCase):
         self.assertIs(seen.get("joint_scale_opt"), True)
 
     def test_post_nonlinearity_names_do_not_skip_gptq_or_scale_sweep(self):
+        # These tests verify flag threading through the SWEPT
+        # path, which is env-gated (default off since 2026-06-12).
+        __import__('os').environ['PRISMAQUANT_GPTQ_DAMP_SWEEP'] = '1'
+        self.addCleanup(lambda: __import__('os').environ.pop(
+            'PRISMAQUANT_GPTQ_DAMP_SWEEP', None))
         """GPTQ and scale_sweep are still valid on post-nonlinearity
         readers such as down_proj/o_proj."""
         import os
@@ -2942,3 +3615,322 @@ class TestActivationAwarePasses(unittest.TestCase):
                 os.environ["PRISMAQUANT_DO_NO_HARM"] = saved_dnh
 
         self.assertEqual(calls, ["gptq", "scale_sweep"])
+
+
+class TestPerRoleGptqDamp(unittest.TestCase):
+    """Per-role GPTQ damp research lever (PRISMAQUANT_GPTQ_DAMP_ROLES)."""
+
+    def setUp(self):
+        import os
+        import prismaquant.export_native_compressed as m
+        self.m = m
+        self._saved = {
+            k: os.environ.get(k)
+            for k in ("PRISMAQUANT_GPTQ_DAMP_ROLES", "PRISMAQUANT_GPTQ_DAMP")
+        }
+        for k in self._saved:
+            os.environ.pop(k, None)
+        m._GPTQ_DAMP_ROLE_CACHE.clear()
+
+    def tearDown(self):
+        import os
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self.m._GPTQ_DAMP_ROLE_CACHE.clear()
+
+    def test_role_of_maps_known_linears(self):
+        role = self.m._gptq_role_of
+        self.assertEqual(role("model.layers.3.mlp.gate_proj"), "gate_up")
+        self.assertEqual(role("model.layers.3.mlp.up_proj"), "gate_up")
+        self.assertEqual(role("model.layers.3.mlp.down_proj"), "down")
+        self.assertEqual(role("model.layers.0.self_attn.o_proj"), "o_proj")
+        self.assertEqual(role("model.layers.0.self_attn.q_proj"), "qkv")
+        self.assertEqual(role("model.layers.0.self_attn.k_proj"), "qkv")
+        self.assertEqual(role("model.layers.0.self_attn.v_proj"), "qkv")
+        self.assertEqual(role("model.embed_tokens"), "other")
+
+    def test_unset_is_exact_noop(self):
+        # No env => per-role resolver == the global fixed default (1.0), so the
+        # production render is preserved bit-for-bit.
+        self.assertEqual(self.m._resolve_gptq_fixed_damp(), 1.0)
+        for q in ("model.layers.1.mlp.gate_proj",
+                  "model.layers.1.mlp.down_proj",
+                  "model.layers.1.self_attn.q_proj"):
+            self.assertEqual(self.m._resolve_gptq_damp_for_role(q), 1.0)
+
+    def test_role_table_applied_with_fallback(self):
+        import os
+        os.environ["PRISMAQUANT_GPTQ_DAMP_ROLES"] = \
+            "qkv=1.0,o_proj=1.0,gate_up=0.3,down=3.0"
+        r = self.m._resolve_gptq_damp_for_role
+        self.assertEqual(r("model.layers.2.mlp.gate_proj"), 0.3)
+        self.assertEqual(r("model.layers.2.mlp.up_proj"), 0.3)
+        self.assertEqual(r("model.layers.2.mlp.down_proj"), 3.0)
+        self.assertEqual(r("model.layers.2.self_attn.o_proj"), 1.0)
+        self.assertEqual(r("model.layers.2.self_attn.q_proj"), 1.0)
+        # 'other' role is unlisted => falls back to the global default (1.0).
+        self.assertEqual(r("model.embed_tokens"), 1.0)
+
+    def test_unlisted_role_falls_back_to_global_override(self):
+        # Listed roles win; unlisted roles take the PRISMAQUANT_GPTQ_DAMP base.
+        import os
+        os.environ["PRISMAQUANT_GPTQ_DAMP"] = "0.5"
+        os.environ["PRISMAQUANT_GPTQ_DAMP_ROLES"] = "gate_up=0.3"
+        r = self.m._resolve_gptq_damp_for_role
+        self.assertEqual(r("model.layers.2.mlp.gate_proj"), 0.3)
+        self.assertEqual(r("model.layers.2.mlp.down_proj"), 0.5)
+        self.assertEqual(r("model.layers.2.self_attn.q_proj"), 0.5)
+
+    def test_malformed_entries_ignored(self):
+        import os
+        os.environ["PRISMAQUANT_GPTQ_DAMP_ROLES"] = \
+            "gate_up=0.3,down=oops,,=1.0,qkv=-2,o_proj=2.0"
+        table = self.m._parse_gptq_damp_roles(
+            os.environ["PRISMAQUANT_GPTQ_DAMP_ROLES"])
+        self.assertEqual(table, {"gate_up": 0.3, "o_proj": 2.0})
+
+
+class TestExportMatchRenderScaleRuleM19(unittest.TestCase):
+    """M19: NVFP4 export re-derive honors the render's recorded scale rule."""
+
+    def setUp(self):
+        import os
+        import prismaquant.export_native_compressed as m
+        self.m = m
+        self._saved = os.environ.get(
+            "PRISMAQUANT_NVFP4_EXPORT_MATCH_RENDER_SCALE")
+        os.environ.pop("PRISMAQUANT_NVFP4_EXPORT_MATCH_RENDER_SCALE", None)
+
+    def tearDown(self):
+        import os
+        if self._saved is None:
+            os.environ.pop("PRISMAQUANT_NVFP4_EXPORT_MATCH_RENDER_SCALE", None)
+        else:
+            os.environ["PRISMAQUANT_NVFP4_EXPORT_MATCH_RENDER_SCALE"] = self._saved
+
+    def test_match_helper_returns_recorded_rule_by_default(self):
+        class _C:
+            levers = {"nvfp4_scale_rule": "joint_mse"}
+        self.assertEqual(
+            self.m._export_match_render_scale_rule(_C()), "joint_mse")
+
+    def test_match_helper_gate_off_is_none(self):
+        import os
+        os.environ["PRISMAQUANT_NVFP4_EXPORT_MATCH_RENDER_SCALE"] = "0"
+
+        class _C:
+            levers = {"nvfp4_scale_rule": "joint_mse"}
+        self.assertIsNone(self.m._export_match_render_scale_rule(_C()))
+
+    def test_match_helper_no_recorded_rule_is_none(self):
+        class _C:
+            levers = {}
+        self.assertIsNone(self.m._export_match_render_scale_rule(_C()))
+        self.assertIsNone(self.m._export_match_render_scale_rule(object()))
+
+    def test_temporary_scale_rule_sets_and_restores(self):
+        m = self.m
+        prev = m._NVFP4_SCALE_RULE
+        with m._temporary_export_nvfp4_scale_rule("joint_mse"):
+            self.assertEqual(
+                m._NVFP4_SCALE_RULE, m.resolve_nvfp4_scale_rule("joint_mse"))
+        self.assertEqual(m._NVFP4_SCALE_RULE, prev)
+        with m._temporary_export_nvfp4_scale_rule(None):  # falsy = no-op
+            self.assertEqual(m._NVFP4_SCALE_RULE, prev)
+
+    def test_rule_actually_changes_packed_scales(self):
+        # joint_mse explores extra per-group scale levels ({6,4,...}) and picks
+        # the min-MSE one, so on a generic Gaussian weight its chosen group
+        # scales differ from static_6's fixed max->6 — proving the rule plumbs
+        # through the export re-derive (not just the helper).
+        m = self.m
+        torch.manual_seed(0)
+        w = torch.randn(8, 16)
+        with m._temporary_export_nvfp4_scale_rule("static_6"):
+            _, s6, _ = m.quantize_dequantize_nvfp4(w, group_size=16)
+        with m._temporary_export_nvfp4_scale_rule("joint_mse"):
+            _, sj, _ = m.quantize_dequantize_nvfp4(w, group_size=16)
+        self.assertFalse(
+            torch.equal(s6, sj),
+            "joint_mse should select different group scales than static_6")
+
+
+class TestMtpCacheCoveragePreflight(unittest.TestCase):
+    def test_missing_mtp_entries_diagnosed_at_attach_time(self):
+        # QC M17: non-BF16 mtp.* with an attached cache must fail with the
+        # producer-absence contract named, not a generic missing-keys error
+        # (and never reach the late in-memory materialization gate).
+        from prismaquant import export_native_compressed as enc
+
+        keys, missing = enc._production_cache_expected_keys({
+            "model.layers.0.self_attn.q_proj": "NVFP4",
+            "mtp.layers.0.mlp.gate_proj": "NVFP4",
+        })
+        mtp_missing = [k for k in missing if str(k[0]).startswith("mtp.")]
+        self.assertTrue(
+            mtp_missing,
+            "mtp.* entries must surface in the attach-time coverage check",
+        )
+
+
+class TestPackedExpertMatchRenderScaleRule(unittest.TestCase):
+    """M2 (2026-07-02 audit): the packed-expert re-pack honors the render's
+    RECORDED NVFP4 scale rule (the dense M19 wrap, lifted to packed experts).
+
+    Cache levers record joint_mse; the export-entry env default is static_6.
+    The re-derived packed-expert bytes must match a direct joint_mse
+    re-quantization, not static_6."""
+
+    def test_packed_expert_repack_uses_recorded_joint_mse_rule(self):
+        from prismaquant.production_weight_cache import ProductionWeightCache
+
+        torch.manual_seed(1234)
+        root = _tiny_qwen_packed_root()
+        experts = root.model.language_model.layers[0].mlp.experts
+        live_prefix = "model.language_model.layers.0.mlp.experts"
+
+        # "Cached renders": arbitrary bf16-storable tensors (values don't
+        # need to be grid-valued for the rule pin — the codes just have to
+        # follow the recorded rule on re-derive).
+        cached_gup = (torch.randn_like(experts.gate_up_proj) * 0.2).float()
+        cached_down = (torch.randn_like(experts.down_proj) * 0.2).float()
+
+        cache = ProductionWeightCache(
+            weights={
+                (f"{live_prefix}.gate_up_proj", "NVFP4"): cached_gup,
+                (f"{live_prefix}.down_proj", "NVFP4"): cached_down,
+            },
+            levers={"gptq": True, "nvfp4_scale_rule": "joint_mse"},
+            activation_max_abs={
+                f"{live_prefix}.gate_up_proj": 3.0,
+                f"{live_prefix}.down_proj": 3.0,
+            },
+        )
+
+        assignment = {
+            "model.layers.0.mlp.experts.gate_up_proj": "NVFP4",
+            "model.layers.0.mlp.experts.down_proj": "NVFP4",
+        }
+
+        saved_cache = enc._PRODUCTION_WEIGHT_CACHE
+        saved_rule = enc._NVFP4_SCALE_RULE
+        saved_flags = dict(enc._ACT_AWARE_FLAGS)
+        try:
+            enc._PRODUCTION_WEIGHT_CACHE = cache
+            # Export-entry default rule: static_6 (the M2 trigger).
+            enc._NVFP4_SCALE_RULE = enc.NVFP4_SCALE_RULE_STATIC_6
+            for k in enc._ACT_AWARE_FLAGS:
+                enc._ACT_AWARE_FLAGS[k] = False
+            tensors, hist = enc._materialize_tensors_inmemory(
+                root,
+                assignment,
+                bf16_passthrough=set(),
+                profile=Qwen3_5Profile(),
+            )
+        finally:
+            enc._PRODUCTION_WEIGHT_CACHE = saved_cache
+            enc._NVFP4_SCALE_RULE = saved_rule
+            enc._ACT_AWARE_FLAGS.clear()
+            enc._ACT_AWARE_FLAGS.update(saved_flags)
+
+        # down_proj expert 0: single projection -> per-Linear global.
+        got = tensors[f"{live_prefix}.0.down_proj.weight_packed"]
+        with enc._temporary_export_nvfp4_scale_rule("joint_mse"):
+            wp_joint, _ws, _wg = enc.quantize_dequantize_nvfp4(
+                cached_down[0], group_size=16)
+        with enc._temporary_export_nvfp4_scale_rule("static_6"):
+            wp_static, _ws6, _wg6 = enc.quantize_dequantize_nvfp4(
+                cached_down[0], group_size=16)
+        # The pin must be discriminating: the two rules disagree here.
+        self.assertFalse(torch.equal(wp_joint, wp_static))
+        self.assertTrue(torch.equal(got, wp_joint))
+
+        # gate_up expert 0: gate/up halves share a joint global. The
+        # export computes it from the SOURCE packed param (pre-existing
+        # contract) — but now under the SAME recorded rule as the
+        # re-derive of the cached dequant.
+        src_gup = experts.gate_up_proj.detach().float()
+        rows = src_gup.shape[1] // 2
+        with enc._temporary_export_nvfp4_scale_rule("joint_mse"):
+            joint = torch.stack([
+                enc.compute_nvfp4_global_real(
+                    src_gup[0][:rows], group_size=16),
+                enc.compute_nvfp4_global_real(
+                    src_gup[0][rows:], group_size=16),
+            ]).max()
+            wp_gate_joint, _s, _g = enc.quantize_dequantize_nvfp4(
+                cached_gup[0][:rows], group_size=16,
+                global_real_override=joint)
+        got_gate = tensors[f"{live_prefix}.0.gate_proj.weight_packed"]
+        self.assertTrue(torch.equal(got_gate, wp_gate_joint))
+
+
+class TestGptqDeadColumnHandling(unittest.TestCase):
+    """§3.16 (2026-07-02 audit): dead columns (diag(H)<=0) are detected
+    BEFORE damping — the old check ran after damping and never fired —
+    and their weights are NOT zeroed (serving-safe deviation from
+    reference GPTQ)."""
+
+    def test_dead_activation_column_survives_nvfp4_gptq(self):
+        from prismaquant.export_native_compressed import (
+            _gptq_obs_rounding_nvfp4,
+        )
+        torch.manual_seed(21)
+        W = torch.randn(16, 32) * 0.3
+        X = torch.randn(64, 32)
+        dead_col = 7
+        X[:, dead_col] = 0.0
+        out = _gptq_obs_rounding_nvfp4(W, X, group_size=16)
+        # The unexercised column is quantized, not destroyed.
+        self.assertGreater(float(out[:, dead_col].abs().max()), 0.0)
+        self.assertTrue(torch.isfinite(out).all())
+
+    def test_dead_activation_column_survives_fp8_and_mxfp4_gptq(self):
+        from prismaquant.export_native_compressed import (
+            _gptq_obs_rounding_fp8_like,
+            _gptq_obs_rounding_mxfp4,
+        )
+        torch.manual_seed(22)
+        W = torch.randn(16, 64) * 0.3
+        X = torch.randn(96, 64)
+        dead_col = 11
+        X[:, dead_col] = 0.0
+        _q, _s, dq_fp8 = _gptq_obs_rounding_fp8_like(
+            W, X, fmt="FP8_E4M3")
+        self.assertGreater(float(dq_fp8[:, dead_col].abs().max()), 0.0)
+        _q4, _s4, dq_mx4 = _gptq_obs_rounding_mxfp4(W, X, group_size=32)
+        self.assertGreater(float(dq_mx4[:, dead_col].abs().max()), 0.0)
+
+
+class TestCholeskyFallbackKeepsJointGlobal(unittest.TestCase):
+    """§3.18 (2026-07-02 audit): when the GPTQ Cholesky fails under
+    joint_scale_opt, the RTN fallback must carry the JSO-optimized
+    tensor global instead of silently recomputing a per-tensor default."""
+
+    def test_fallback_uses_jso_optimized_global(self):
+        from unittest import mock
+        torch.manual_seed(911)
+        W = torch.randn(16, 32) * 0.3
+        X = torch.randn(48, 32)
+
+        # Expected: replicate the pre-Cholesky global computation of
+        # _gptq_obs_rounding_nvfp4 under joint_scale_opt.
+        W32 = W.to(torch.float32)
+        grouped = W32.reshape(16, 32 // 16, 16)
+        s_g = enc._select_nvfp4_group_scales(
+            grouped, scale_rule=enc.NVFP4_SCALE_RULE_JOINT_MSE)
+        base = (s_g.amax() / enc.FP8_E4M3_MAX).clamp_min(1e-12)
+        opt = enc._optimize_nvfp4_joint_global_real(
+            W32, group_size=16, base_global_real=base)
+        expected = enc._rtn_dequant_nvfp4(
+            W, group_size=16, global_real_override=opt)
+
+        with mock.patch(
+                "torch.linalg.cholesky", side_effect=RuntimeError("boom")):
+            got = enc._gptq_obs_rounding_nvfp4(
+                W, X, group_size=16, joint_scale_opt=True)
+
+        torch.testing.assert_close(got, expected)

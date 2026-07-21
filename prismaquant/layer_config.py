@@ -19,6 +19,15 @@ def strip_weight(name: str) -> str:
     return name[:-len(".weight")] if name.endswith(".weight") else name
 
 
+# GGUF k-quant + IQ lane (llama.cpp / vLLM-GGUF serving). Kept as an explicit
+# literal so this module stays torch-free; pinned to gguf_formats.GGUF_BLOCK_BYTES
+# by test_gguf_formats.test_layer_config_gguf_names_stay_in_sync.
+_GGUF_FORMAT_NAMES = frozenset(
+    {"Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q8_0",
+     "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ4_XS", "IQ4_NL"}
+)
+
+
 def canonicalize_format(entry: dict | str | int) -> str:
     """Map a layer-config entry to an export/runtime format name.
 
@@ -29,6 +38,11 @@ def canonicalize_format(entry: dict | str | int) -> str:
     if isinstance(entry, dict):
         dt = entry.get("data_type")
         bits = int(entry.get("bits", 0))
+        if dt == "gguf":
+            gguf_type = str(entry.get("gguf_type", "")).upper()
+            if gguf_type not in _GGUF_FORMAT_NAMES:
+                raise ValueError(f"unsupported gguf scheme: {entry!r}")
+            return gguf_type
         if dt == "nv_fp" and bits == 4:
             return "NVFP4"
         if dt == "mx_fp" and bits == 4:
@@ -63,6 +77,8 @@ def canonicalize_format(entry: dict | str | int) -> str:
         raise ValueError(f"unsupported scheme: {entry!r}")
     if isinstance(entry, str):
         value = entry.lower()
+        if value.upper() in _GGUF_FORMAT_NAMES:
+            return value.upper()
         if value in ("nvfp4", "fp4", "4"):
             return "NVFP4"
         if value in ("mxfp4", "mx_fp4"):

@@ -8,7 +8,11 @@ import torch.nn as nn
 import pytest
 
 from prismaquant.kl_sensitivity_probe import _normalized_production_cache_levers
+from prismaquant.build_production_cache import (
+    validate_render_assignment_cache_coverage,
+)
 from prismaquant.production_weight_cache import ProductionWeightCache
+from prismaquant.production_weight_cache import fill_packed_expert_cache_entries
 from prismaquant.production_weight_cache import _format_supports_render_mechanism
 from prismaquant.production_weight_cache import fill_production_weight_cache
 from prismaquant.production_recache import (
@@ -124,6 +128,50 @@ def test_assignment_keys_ignore_uncached_packed_expert_entries(tmp_path):
 
     assert keys == [("dense", "NVFP4")]
     assert missing == [("missing_dense", "NVFP4")]
+
+
+def test_assignment_keys_can_require_packed_expert_entries(tmp_path):
+    cache = ProductionWeightCache(weights={}, levers={}, cache_dir=str(tmp_path))
+
+    keys, missing = cache.assignment_keys(
+        {"model.layers.0.mlp.experts.gate_up_proj": "NVFP4"},
+        include_packed_experts=True,
+    )
+
+    assert keys == []
+    assert missing == [(
+        "model.layers.0.mlp.experts.gate_up_proj",
+        "NVFP4",
+    )]
+
+
+def test_packed_expert_cache_docstring_describes_batched_recipe():
+    doc = fill_packed_expert_cache_entries.__doc__ or ""
+
+    assert "fixed-damp batched GPTQ" in doc
+    assert "without dense JSO/act-order/damp-sweep" in doc
+    assert "identical GPTQ + JSO + damp-sweep" not in doc
+
+
+def test_build_render_assignment_coverage_does_not_skip_packed_experts():
+    cache = ProductionWeightCache(
+        weights={("dense", "NVFP4"): torch.ones((2, 2))},
+        levers={},
+    )
+    assignment = {
+        "dense": "NVFP4",
+        "model.layers.0.mlp.experts.gate_up_proj": "NVFP4",
+        "bf16": "BF16",
+    }
+
+    with pytest.raises(RuntimeError, match="assignment coverage failure"):
+        validate_render_assignment_cache_coverage(cache, assignment)
+
+    cache.weights[(
+        "model.layers.0.mlp.experts.gate_up_proj",
+        "NVFP4",
+    )] = torch.ones((2, 2, 2))
+    validate_render_assignment_cache_coverage(cache, assignment)
 
 
 def test_production_cache_file_page_prefetch_does_not_load_tensors(tmp_path, monkeypatch):
@@ -1085,6 +1133,62 @@ def test_production_recache_measures_quantized_upstream_activation_range():
     assert delta["ratio_p50"] == pytest.approx(2.0)
 
 
+def test_production_recache_tempdir_uses_requested_parent(monkeypatch, tmp_path):
+    import prismaquant.production_recache as production_recache
+
+    seen_dirs: list[Path] = []
+
+    class FakeTemporaryDirectory:
+        def __init__(self, *, prefix, dir):
+            del prefix
+            self.path = Path(dir) / "fake_recache"
+            seen_dirs.append(Path(dir))
+
+        def __enter__(self):
+            self.path.mkdir(parents=True, exist_ok=True)
+            return str(self.path)
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeActivationCache:
+        def __init__(self, *args, **kwargs):
+            self.max_abs = {"q": 1.0}
+
+        def install(self):
+            pass
+
+        def remove(self):
+            pass
+
+    monkeypatch.setattr(
+        production_recache.tempfile,
+        "TemporaryDirectory",
+        FakeTemporaryDirectory,
+    )
+    monkeypatch.setattr(
+        production_recache,
+        "PerturbedActivationCache",
+        FakeActivationCache,
+    )
+    monkeypatch.setattr(
+        production_recache,
+        "iter_calibration_forwards",
+        lambda *args, **kwargs: [],
+    )
+
+    production_recache.measure_production_activation_max_abs(
+        nn.Linear(1, 1),
+        torch.ones(1, 1, dtype=torch.long),
+        {"q": "BF16"},
+        ProductionWeightCache(weights={}, levers={}),
+        progress=False,
+        temp_parent=tmp_path,
+    )
+
+    assert seen_dirs == [tmp_path]
+
+
 def test_activation_max_abs_delta_summary_reports_ratio_quantiles():
     summary = activation_max_abs_delta_summary(
         {"a": 1.0, "b": 2.0, "c": 4.0, "missing": 3.0},
@@ -1132,3 +1236,100 @@ def test_recache_assignment_loader_is_exporter_independent(monkeypatch, tmp_path
     monkeypatch.setattr("builtins.__import__", guarded_import)
 
     assert _load_assignment(path) == {"layer": "NVFP4"}
+
+
+def test_render_gate_scores_on_gptq_clipped_activations():
+    """Audit 2026-07-02 §3.9: the cache-fill progressive gate must score
+    candidates on the SAME clipped activation matrix the GPTQ loop optimized
+    under (export's shared-matrix contract), not the raw outlier-carrying
+    capture — otherwise accept-vs-RTN decisions near ties are biased by the
+    outlier rows."""
+    import prismaquant.production_weight_cache as pwc
+    from prismaquant import export_native_compressed as enc
+    from prismaquant.render_score import score_render_error
+
+    torch.manual_seed(0)
+    weight = torch.randn(8, 32)
+    acts = torch.randn(64, 32) * 0.3
+    acts[5] = 40.0    # outlier tokens: clipped away by the GPTQ matrix
+    acts[17] = -55.0
+    clip = 1.0
+
+    trace: list[dict] = []
+    rendered = pwc.render_production_weight(
+        weight,
+        "NVFP4",
+        qname="lin",
+        activations={"lin": acts},
+        levers={"gptq": True},
+        act_clip_threshold=clip,
+        gate_trace=trace,
+    )
+
+    X = enc._activation_matrix_for_gptq(
+        acts.float(), 32, clip_threshold=clip, clip_rescale="none",
+    )
+
+    # Baseline candidate = static_6 RTN; its recorded gate score must be the
+    # shared scorer evaluated on the CLIPPED matrix, not on raw acts.
+    with pwc._temporary_nvfp4_scale_rule(enc.NVFP4_SCALE_RULE_STATIC_6):
+        baseline = enc._rtn_dequant_nvfp4(weight.float(), group_size=16)
+    expected_clipped = score_render_error(weight.float(), baseline, X)
+    raw_score = score_render_error(weight.float(), baseline, acts.float())
+    assert trace[0]["mechanism"] == "baseline"
+    assert trace[0]["metric"] == "output_mse"
+    assert trace[0]["score"] == pytest.approx(expected_clipped, rel=1e-5)
+    # Sanity: on this outlier set the two matrices give very different
+    # scores, so the assertion above actually discriminates.
+    assert abs(raw_score - expected_clipped) > 10.0 * expected_clipped
+
+    # The selected candidate's recorded score is also clip-consistent with
+    # the returned weight.
+    final_clipped = score_render_error(weight.float(), rendered.float(), X)
+    step = trace[1]
+    assert step["mechanism"] in ("gptq", "fisher_gptq")
+    selected_score = (
+        step["candidate_score"] if step["accepted"] else step["baseline_score"]
+    )
+    assert selected_score == pytest.approx(final_clipped, rel=1e-5)
+
+
+def test_non_nv_render_gate_scores_on_gptq_clipped_activations():
+    """Same clip-consistency contract for the non-NVFP4 (FP8) gate path."""
+    import prismaquant.production_weight_cache as pwc
+    from prismaquant import export_native_compressed as enc
+    from prismaquant import format_registry as fr
+    from prismaquant.render_score import score_render_error
+
+    torch.manual_seed(1)
+    weight = torch.randn(8, 32)
+    acts = torch.randn(64, 32) * 0.3
+    acts[9] = 35.0
+    clip = 1.0
+
+    trace: list[dict] = []
+    rendered = pwc.render_production_weight(
+        weight,
+        "FP8_E4M3",
+        qname="lin",
+        activations={"lin": acts},
+        levers={"gptq": True},
+        act_clip_threshold=clip,
+        gate_trace=trace,
+    )
+
+    X = enc._activation_matrix_for_gptq(
+        acts.float(), 32, clip_threshold=clip, clip_rescale="none",
+    )
+    baseline = fr.get_format("FP8_E4M3").quantize_dequantize(
+        weight.detach().clone()
+    )
+    expected_clipped = score_render_error(weight.float(), baseline.float(), X)
+    assert trace[0]["mechanism"] == "baseline"
+    assert trace[0]["score"] == pytest.approx(expected_clipped, rel=1e-5)
+    final_clipped = score_render_error(weight.float(), rendered.float(), X)
+    step = trace[1]
+    selected_score = (
+        step["candidate_score"] if step["accepted"] else step["baseline_score"]
+    )
+    assert selected_score == pytest.approx(final_clipped, rel=1e-5)
